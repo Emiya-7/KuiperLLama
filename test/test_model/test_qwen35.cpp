@@ -7,6 +7,7 @@
 #include <string>
 #include <unistd.h>
 #include "model/qwen35.h"
+#include "op/encode.h"
 
 // These exercise the hybrid plumbing on a small synthetic checkpoint written by
 // test/test_model/make_tiny_qwen35.py: same structure as the published 4B/9B
@@ -133,6 +134,22 @@ TEST(Qwen35Config, RejectsZeroIntervalInModelHeader) {
   EXPECT_EQ(status.get_err_code(), base::StatusCode::kModelParseError);
   EXPECT_NE(status.get_err_msg().find("full_attention_interval"), std::string::npos);
   EXPECT_EQ(std::remove(path), 0);
+}
+
+TEST(Qwen35Tokenizer, MatchesTransformersChatPrompt) {
+  if (!tiny_token_path()) {
+    GTEST_SKIP() << "set KUIPER_TINY_QWEN35_TOKENIZER to run";
+  }
+
+  op::QwenEncodeLayer tokenizer(tiny_token_path(), false, false);
+  const std::string prompt =
+      "<|im_start|>user\nWhat is AI?<|im_end|>\n<|im_start|>assistant\n";
+  const std::vector<int32_t> expected = {248045, 846,    198, 3710, 369, 14791,
+                                         30,     248046, 198, 248045, 74455, 198};
+  const auto tokens = tokenizer.encode(prompt);
+
+  EXPECT_EQ(tokens, expected);
+  EXPECT_EQ(tokenizer.decode(tokens), prompt);
 }
 
 // Loading is where an export/reader layout drift would show up: create_param_layers
