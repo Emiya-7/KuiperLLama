@@ -27,8 +27,23 @@ void Qwen35Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
 
   move(add_layer_);
   move(swiglu_layer_);
+
+  // Tied checkpoints point embedding and lm_head at the same mmap range. A
+  // naive pair of Tensor::to_cuda calls allocates and copies that table twice
+  // (about 1.27 GB for Qwen3.5-4B BF16). Detect the shared host storage before
+  // moving it, then bind the classifier to the embedding's device buffer.
+  const auto embedding = std::dynamic_pointer_cast<op::EmbeddingLayer>(embedding_layer_);
+  const auto classifier = std::dynamic_pointer_cast<op::MatmulLayer>(cls_layer_);
+  const bool tied_weights = embedding && classifier &&
+                            embedding->get_weight(0).ptr<uint8_t>() ==
+                                classifier->get_weight(0).ptr<uint8_t>();
   move(embedding_layer_);
-  move(cls_layer_);
+  if (tied_weights) {
+    classifier->set_cuda_config(config);
+    classifier->set_weight(0, embedding->get_weight(0));
+  } else {
+    move(cls_layer_);
+  }
   move(final_norm_);
   move(mha_layer_);
   move(rope_layer_);
