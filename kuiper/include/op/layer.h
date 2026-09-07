@@ -185,6 +185,9 @@ class LayerParam : public Layer {
   base::Status set_weight(int32_t idx, const std::vector<int32_t>& dims, const void* weight_ptr,
                           base::DeviceType device_type = base::DeviceType::kDeviceUnknown) override;
 
+  base::Status set_weight(int32_t idx, const std::vector<int32_t>& dims, const void* weight_ptr,
+                          base::DeviceType device_type, base::DataType weight_type);
+
   void set_scales(const tensor::Tensor& scales);
 
   void set_group_size(int32_t group_size);

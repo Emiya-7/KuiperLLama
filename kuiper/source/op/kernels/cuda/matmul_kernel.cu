@@ -1,5 +1,6 @@
 #include <tensor/tensor.h>
 #include <cub/block/block_reduce.cuh>
+#include <cuda_bf16.h>
 #include "../kernels_interface.h"
 #include "matmul_kernel.cuh"
 namespace kernel {
@@ -54,6 +55,37 @@ __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, f
 }
 
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
+__global__ void matmul_kernel_cu_fp32bf16(const float* input, const __nv_bfloat16* weight,
+                                          float* output, int M, int K) {
+  __shared__ float sdata[THREAD_PER_BLOCK];
+  const unsigned int tid = threadIdx.x;
+  const int start_row = blockIdx.x * ROW_PER_BLOCK;
+  const int end_row = min(start_row + ROW_PER_BLOCK, K);
+  if (start_row >= K) {
+    return;
+  }
+
+  for (int row = start_row; row < end_row; ++row) {
+    float sum = 0.f;
+    const int row_offset = row * M;
+    for (int i = tid; i < M; i += THREAD_PER_BLOCK) {
+      sum += input[i] * __bfloat162float(weight[row_offset + i]);
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    using BlockReduce = cub::BlockReduce<float, THREAD_PER_BLOCK>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    const float total = BlockReduce(temp).Sum(sdata[tid]);
+    __syncthreads();
+    if (tid == 0) {
+      output[row] = total;
+    }
+    __syncthreads();
+  }
+}
+
+template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
 __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weight,
                                           const float* scales, const int32_t group_size,
                                           float* output, int M, int K) {
@@ -95,16 +127,17 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   CHECK(weight.device_type() == base::DeviceType::kDeviceCUDA);
   const int32_t K = weight.get_dim(0);  // row
   const int32_t M = weight.get_dim(1);  // col
-  int packet_size = 4;
-  // CHECK_EQ(M % packet_size, 0);
 
   CHECK_EQ(M, input.get_dim(0));
-  if (config && config->stream) {
-    matmul_kernel_cu_fp32<128, 1><<<K, 128, 0, config->stream>>>(
-        input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K);
+  cudaStream_t stream = config ? config->stream : nullptr;
+  if (weight.data_type() == base::DataType::kDataTypeBf16) {
+    matmul_kernel_cu_fp32bf16<128, 1><<<K, 128, 0, stream>>>(
+        input.ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>()),
+        const_cast<float*>(output.ptr<float>()), M, K);
   } else {
-    matmul_kernel_cu_fp32<128, 1><<<K, 128>>>(input.ptr<float>(), weight.ptr<float>(),
-                                              const_cast<float*>(output.ptr<float>()), M, K);
+    CHECK(weight.data_type() == base::DataType::kDataTypeFp32);
+    matmul_kernel_cu_fp32<128, 1><<<K, 128, 0, stream>>>(
+        input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K);
   }
 }
 

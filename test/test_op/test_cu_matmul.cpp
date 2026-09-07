@@ -6,7 +6,30 @@
 #include "../source/op/kernels/kernels_interface.h"
 #include "../utils.cuh"
 #include "base/buffer.h"
+#include "base/bfloat16.h"
 using namespace kernel;
+
+TEST(test_matmul_bf16, fp32_input_bf16_weight_cpu) {
+  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+  tensor::Tensor input(base::DataType::kDataTypeFp32, 4, true, alloc_cpu);
+  tensor::Tensor weight(base::DataType::kDataTypeBf16, 3, 4, true, alloc_cpu);
+  tensor::Tensor output(base::DataType::kDataTypeFp32, 3, true, alloc_cpu);
+
+  const float input_values[4] = {1.f, -2.f, 0.5f, 3.f};
+  const float weight_values[12] = {1.f,  2.f,  3.f,  4.f,  -1.f, 0.5f,
+                                   2.f,  -3.f, 0.25f, 0.5f, 1.f,  -1.f};
+  for (int i = 0; i < 4; ++i) {
+    input.index<float>(i) = input_values[i];
+  }
+  for (int i = 0; i < 12; ++i) {
+    weight.index<uint16_t>(i) = base::float_to_bfloat16(weight_values[i]);
+  }
+
+  matmul_kernel_cpu(input, weight, output);
+  EXPECT_FLOAT_EQ(output.index<float>(0), 10.5f);
+  EXPECT_FLOAT_EQ(output.index<float>(1), -10.f);
+  EXPECT_FLOAT_EQ(output.index<float>(2), -3.25f);
+}
 TEST(test_matmul_cu, matmul_linear_stream5) {
   auto alloc_cu = base::CUDADeviceAllocatorFactory::get_instance();
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();

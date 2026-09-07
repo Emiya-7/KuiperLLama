@@ -24,7 +24,12 @@ base::Status MatmulLayer::check() const {
   }
 
   if (!is_quant_layer_) {
-    status = check_tensor_with_dim(get_weight(0), device_type_, data_type_, dim0_, dim1_);
+    const auto weight_type = get_weight(0).data_type();
+    if (weight_type != base::DataType::kDataTypeFp32 &&
+        weight_type != base::DataType::kDataTypeBf16) {
+      return base::error::InvalidArgument("Matmul weight must be fp32 or bf16.");
+    }
+    status = check_tensor_with_dim(get_weight(0), device_type_, weight_type, dim0_, dim1_);
     if (!status) {
       LOG(ERROR) << "The weight tensor error in the matmul layer.";
       return status;
