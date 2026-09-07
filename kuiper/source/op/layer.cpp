@@ -26,6 +26,12 @@ base::Status BaseLayer::set_weight(int32_t idx, const std::vector<int32_t>& dims
   return base::error::FunctionNotImplement();
 }
 
+base::Status BaseLayer::set_weight(int32_t idx, const std::vector<int32_t>& dims,
+                                   const void* weight_ptr, base::DeviceType device_type,
+                                   base::DataType weight_type) {
+  return base::error::FunctionNotImplement();
+}
+
 const std::string& BaseLayer::get_layer_name() const { return layer_name_; }
 
 void BaseLayer::set_layer_name(const std::string& layer_name) { layer_name_ = layer_name; }

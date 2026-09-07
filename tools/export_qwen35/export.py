@@ -11,8 +11,9 @@ are GQA attention and the rest are Gated DeltaNet. The two kinds carry different
 weights, so the writer walks layers in order and branches on the type.
 
 Reads safetensors directly -- no torch, no transformers, no numpy -- so this runs
-anywhere Python 3.8+ does. bf16/fp16 are widened to fp32 with bytes-level slice
-assignment, which stays in C and is fast enough for 9B.
+anywhere Python 3.8+ does. Version 3 can preserve large embedding/projection
+matrices as BF16 while widening small parameters to FP32. Activations and model
+state remain FP32 in Kuiper.
 
 Usage:
   python3 export.py --model_dir /path/to/Qwen3.5-4B --output qwen35_4b.bin
@@ -26,7 +27,9 @@ import struct
 import sys
 
 MAGIC = ord("K") | (ord("3") << 8) | (ord("5") << 16) | (ord("D") << 24)
-VERSION = 2
+VERSION = 3
+MATRIX_FP32 = 0
+MATRIX_BF16 = 1
 
 LM = "model.language_model."
 
@@ -131,6 +134,26 @@ def to_fp32_bytes(buf, dtype):
     raise ValueError(f"unsupported dtype {dtype}")
 
 
+def to_bf16_bytes(buf, dtype):
+    """Convert a raw tensor buffer to little-endian BF16 with RNE rounding."""
+    if dtype == "BF16":
+        return buf
+    if dtype == "F32":
+        out = bytearray(len(buf) // 2)
+        for index, (bits,) in enumerate(struct.iter_unpack("<I", buf)):
+            rounded = bits + 0x7FFF + ((bits >> 16) & 1)
+            struct.pack_into("<H", out, index * 2, (rounded >> 16) & 0xFFFF)
+        return bytes(out)
+    if dtype == "F16":
+        out = bytearray(len(buf))
+        for index, (value,) in enumerate(struct.iter_unpack("<e", buf)):
+            bits = struct.unpack("<I", struct.pack("<f", value))[0]
+            rounded = bits + 0x7FFF + ((bits >> 16) & 1)
+            struct.pack_into("<H", out, index * 2, (rounded >> 16) & 0xFFFF)
+        return bytes(out)
+    raise ValueError(f"unsupported dtype {dtype}")
+
+
 # ------------------------------------------------------------------- writing
 
 class Writer:
@@ -139,11 +162,16 @@ class Writer:
         self.bytes_written = 0
         self.tensors = 0
 
-    def tensor(self, st, name, expect_shape=None):
+    def tensor(self, st, name, expect_shape=None, output_dtype="fp32"):
         buf, shape, dtype = st.raw(name)
         if expect_shape is not None and list(shape) != list(expect_shape):
             raise ValueError(f"{name}: shape {shape} != expected {expect_shape}")
-        data = to_fp32_bytes(buf, dtype)
+        if output_dtype == "fp32":
+            data = to_fp32_bytes(buf, dtype)
+        elif output_dtype == "bf16":
+            data = to_bf16_bytes(buf, dtype)
+        else:
+            raise ValueError(f"unsupported output dtype {output_dtype}")
         self.f.write(data)
         self.bytes_written += len(data)
         self.tensors += 1
@@ -164,6 +192,12 @@ def main():
         help="clamp for the RoPE cache; the config's 262144 would need ~1GB of tables",
     )
     ap.add_argument("--dry_run", action="store_true", help="validate shapes, write nothing")
+    ap.add_argument(
+        "--weight_dtype",
+        choices=("fp32", "bf16"),
+        default="bf16",
+        help="storage dtype for embedding and projection matrices (default: bf16)",
+    )
     args = ap.parse_args()
 
     with open(os.path.join(args.model_dir, "config.json")) as f:
@@ -217,6 +251,7 @@ def main():
     print(f"layers     : {n_full} full / {n_layer - n_full} linear (interval {interval})")
     print(f"tie_emb    : {tie} (lm_head.weight present: {has_lm_head})")
     print(f"max_seq_len: {args.max_seq_len}")
+    print(f"matrix dtype: {args.weight_dtype} (activations and small parameters stay fp32)")
 
     if args.dry_run:
         # Verify every tensor we intend to read exists with the expected shape.
@@ -270,12 +305,13 @@ def main():
 
     w = Writer(args.output)
     hdr = struct.pack(
-        "<18i2f",
+        "<19i2f",
         MAGIC, VERSION,
         hidden, inter, n_layer, vocab, args.max_seq_len,
         head_num, kv_head_num, head_dim, rotary_dim, interval,
         nk, nv, kd, vd, conv_k,
         1 if tie else 0,
+        MATRIX_BF16 if args.weight_dtype == "bf16" else MATRIX_FP32,
         theta, eps,
     )
     w.f.write(hdr)
@@ -284,7 +320,10 @@ def main():
     # Weight order below is the order Qwen35Model::create_param_layers reads.
     # Global tensors first, then layers in index order so a layer's weights are
     # contiguous on disk and the loader can stream straight through.
-    w.tensor(st, LM + "embed_tokens.weight", [vocab, hidden])
+    def matrix(name, shape):
+        w.tensor(st, name, shape, args.weight_dtype)
+
+    matrix(LM + "embed_tokens.weight", [vocab, hidden])
     w.tensor(st, LM + "norm.weight", [hidden])
 
     for i, t in enumerate(layer_types):
@@ -292,32 +331,32 @@ def main():
         w.tensor(st, p + "input_layernorm.weight", [hidden])
         if t == "full":
             a = p + "self_attn."
-            w.tensor(st, a + "q_proj.weight", [q_proj_out, hidden])
-            w.tensor(st, a + "k_proj.weight", [kv_dim, hidden])
-            w.tensor(st, a + "v_proj.weight", [kv_dim, hidden])
+            matrix(a + "q_proj.weight", [q_proj_out, hidden])
+            matrix(a + "k_proj.weight", [kv_dim, hidden])
+            matrix(a + "v_proj.weight", [kv_dim, hidden])
             w.tensor(st, a + "q_norm.weight", [head_dim])
             w.tensor(st, a + "k_norm.weight", [head_dim])
-            w.tensor(st, a + "o_proj.weight", [hidden, head_num * head_dim])
+            matrix(a + "o_proj.weight", [hidden, head_num * head_dim])
         else:
             a = p + "linear_attn."
-            w.tensor(st, a + "in_proj_qkv.weight", [conv_dim, hidden])
-            w.tensor(st, a + "in_proj_z.weight", [v_dim, hidden])
-            w.tensor(st, a + "in_proj_a.weight", [nv, hidden])
-            w.tensor(st, a + "in_proj_b.weight", [nv, hidden])
+            matrix(a + "in_proj_qkv.weight", [conv_dim, hidden])
+            matrix(a + "in_proj_z.weight", [v_dim, hidden])
+            matrix(a + "in_proj_a.weight", [nv, hidden])
+            matrix(a + "in_proj_b.weight", [nv, hidden])
             w.tensor(st, a + "conv1d.weight", [conv_dim, 1, conv_k])
             w.tensor(st, a + "A_log", [nv])
             w.tensor(st, a + "dt_bias", [nv])
             w.tensor(st, a + "norm.weight", [vd])
-            w.tensor(st, a + "out_proj.weight", [hidden, v_dim])
+            matrix(a + "out_proj.weight", [hidden, v_dim])
         w.tensor(st, p + "post_attention_layernorm.weight", [hidden])
-        w.tensor(st, p + "mlp.gate_proj.weight", [inter, hidden])
-        w.tensor(st, p + "mlp.up_proj.weight", [inter, hidden])
-        w.tensor(st, p + "mlp.down_proj.weight", [hidden, inter])
+        matrix(p + "mlp.gate_proj.weight", [inter, hidden])
+        matrix(p + "mlp.up_proj.weight", [inter, hidden])
+        matrix(p + "mlp.down_proj.weight", [hidden, inter])
         if (i + 1) % 8 == 0 or i + 1 == n_layer:
             print(f"  layer {i + 1}/{n_layer}  {w.bytes_written / 1e9:.2f} GB")
 
     if not tie:
-        w.tensor(st, "lm_head.weight", [vocab, hidden])
+        matrix("lm_head.weight", [vocab, hidden])
 
     w.close()
     st.close()

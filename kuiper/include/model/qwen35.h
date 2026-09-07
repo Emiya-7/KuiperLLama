@@ -180,6 +180,7 @@ class Qwen35Model : public Model {
   std::unique_ptr<Qwen35Layers> layers_;
   mutable std::map<Qwen35Buffer, tensor::Tensor> q35_buffers_;
   HiddenStateCallback hidden_state_callback_;
+  size_t header_size_ = 0;
 };
 
 }  // namespace model

@@ -13,6 +13,11 @@ enum class Qwen35LayerType : int32_t {
   kFullAttention = 1,    // GQA + QK-norm + partial RoPE + output gate
 };
 
+enum class Qwen35MatrixWeightType : int32_t {
+  kFp32 = 0,
+  kBf16 = 1,
+};
+
 // On-disk header for the text tower of a Qwen3.5 checkpoint. Written by
 // tools/export_qwen35/export.py, read by Qwen35Model::read_model_file.
 // All ints are int32 little-endian, all floats are fp32 little-endian, so the
@@ -20,7 +25,7 @@ enum class Qwen35LayerType : int32_t {
 //
 // The existing 7-int LLama/Qwen2 header cannot describe a hybrid model, so this
 // is a separate versioned format rather than an extension of that one.
-struct Qwen35RawConfig {
+struct Qwen35RawConfigV2 {
   int32_t magic;    // 'K'|'3'<<8|'5'<<16|'D'<<24
   int32_t version;  // 2
 
@@ -51,8 +56,40 @@ struct Qwen35RawConfig {
   float rms_norm_eps;
 };
 
+// Version 3 keeps small/numerically sensitive parameters in FP32 and allows
+// embedding/projection matrices to use BF16 storage. The matrix type is part
+// of the header so a loader never has to guess the byte layout.
+struct Qwen35RawConfig {
+  int32_t magic;
+  int32_t version;  // 3
+
+  int32_t hidden_size;
+  int32_t intermediate_size;
+  int32_t layer_num;
+  int32_t vocab_size;
+  int32_t max_seq_len;
+
+  int32_t head_num;
+  int32_t kv_head_num;
+  int32_t head_dim;
+  int32_t rotary_dim;
+  int32_t full_attention_interval;
+
+  int32_t linear_num_k_heads;
+  int32_t linear_num_v_heads;
+  int32_t linear_k_head_dim;
+  int32_t linear_v_head_dim;
+  int32_t conv_kernel_size;
+
+  int32_t tie_word_embeddings;
+  int32_t matrix_weight_type;  // Qwen35MatrixWeightType
+
+  float rope_theta;
+  float rms_norm_eps;
+};
+
 static constexpr int32_t kQwen35Magic = 'K' | ('3' << 8) | ('5' << 16) | ('D' << 24);
-static constexpr int32_t kQwen35Version = 2;
+static constexpr int32_t kQwen35Version = 3;
 
 // Runtime view of the above, with the derived sizes the layers actually need.
 struct Qwen35Config {
@@ -75,6 +112,7 @@ struct Qwen35Config {
   int32_t conv_kernel_size = 0;
 
   bool tie_word_embeddings = false;
+  Qwen35MatrixWeightType matrix_weight_type = Qwen35MatrixWeightType::kFp32;
   float rope_theta = 0.f;
   float rms_norm_eps = 0.f;
 
