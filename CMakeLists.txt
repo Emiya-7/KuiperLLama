@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Set the CUDA compiler path or name
-set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+# Set the CUDA compiler path or name. Only force the conventional location when
+# it actually exists, so -DCMAKE_CUDA_COMPILER=... and distro installs that put
+# nvcc in /usr/bin still work.
+if (NOT DEFINED CMAKE_CUDA_COMPILER AND EXISTS "/usr/local/cuda/bin/nvcc")
+  set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+endif()
 
 project(llama_infer CXX CUDA)
 include(cmake/cuda.cmake)
@@ -28,6 +32,12 @@ option(QWEN3_SUPPORT OFF)
 if (QWEN3_SUPPORT)
   message(STATUS "QWEN3 SUPPORT")
   add_definitions(-DQWEN3_SUPPORT)
+endif()
+
+option(QWEN35_SUPPORT OFF)
+if (QWEN35_SUPPORT)
+  message(STATUS "QWEN3.5 SUPPORT")
+  add_definitions(-DQWEN35_SUPPORT)
 endif()
 # ---- Add dependencies via CPM ----
 # see https://github.com/TheLartians/CPM.cmake for more info
@@ -63,7 +73,7 @@ if(USE_CPM)
   )
   find_package(sentencepiece REQUIRED)
 
-  if (LLAMA3_SUPPORT OR QWEN2_SUPPORT OR QWEN3_SUPPORT)
+  if (LLAMA3_SUPPORT OR QWEN2_SUPPORT OR QWEN3_SUPPORT OR QWEN35_SUPPORT)
     CPMAddPackage(
         NAME absl
         GITHUB_REPOSITORY abseil/abseil-cpp

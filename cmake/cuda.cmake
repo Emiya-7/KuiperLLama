@@ -30,12 +30,19 @@ endif ()
 if (CUDA_FOUND)
     message(STATUS "Found CUDA Toolkit v${CUDA_VERSION_STRING}")
 
-    include(FindCUDA/select_compute_arch)
-    CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
-    string(STRIP "${INSTALLED_GPU_CCS_1}" INSTALLED_GPU_CCS_2)
-    string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${INSTALLED_GPU_CCS_2}")
-    string(REPLACE "." "" CUDA_ARCH_LIST "${INSTALLED_GPU_CCS_3}")
-    SET(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+    # Autodetect the installed GPU's compute capability, but let an explicit
+    # -DCMAKE_CUDA_ARCHITECTURES win. Detection reports the physical card, which
+    # an older toolkit may not be able to target at all (e.g. CUDA 11.5 tops out
+    # at sm_87 and cannot build for an sm_89 card, even though sm_86 cubins run
+    # on it via PTX JIT).
+    if (NOT CMAKE_CUDA_ARCHITECTURES)
+      include(FindCUDA/select_compute_arch)
+      CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
+      string(STRIP "${INSTALLED_GPU_CCS_1}" INSTALLED_GPU_CCS_2)
+      string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${INSTALLED_GPU_CCS_2}")
+      string(REPLACE "." "" CUDA_ARCH_LIST "${INSTALLED_GPU_CCS_3}")
+      SET(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+    endif()
     MESSAGE(STATUS "CMAKE_CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
 
     if (DEFINED CMAKE_CUDA_COMPILER_LIBRARY_ROOT_FROM_NVVMIR_LIBRARY_DIR)

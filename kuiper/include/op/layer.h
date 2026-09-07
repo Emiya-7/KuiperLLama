@@ -20,6 +20,17 @@ enum class LayerType : uint8_t {
   kLayerSoftmax = 8,
   kLayerAdd = 9,
   kLayerSwiGLU = 10,
+  // Qwen3.5-only layers. Appended so the existing values keep their meaning.
+  kLayerL2Norm = 11,
+  kLayerGatedRMSNorm = 12,
+  kLayerCausalConv1D = 13,
+  kLayerGatedDelta = 14,
+  kLayerRoPePartial = 15,
+  kLayerSigmoid = 16,
+  kLayerMul = 17,
+  kLayerSoftplusDecay = 18,
+  kLayerZeroCenteredRMSNorm = 19,
+  kLayerSplitHeadInterleaved = 20,
 };
 
 class BaseLayer {

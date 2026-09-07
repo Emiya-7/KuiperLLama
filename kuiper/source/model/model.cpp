@@ -151,7 +151,7 @@ base::Status Model::create_encode_layer() {
     encode_layer_ = std::make_unique<op::BpeEncodeLayer>(this->token_path_, true, false);
 #endif
 
-#if defined(QWEN2_SUPPORT) || defined(QWEN3_SUPPORT)
+#if defined(QWEN2_SUPPORT) || defined(QWEN3_SUPPORT) || defined(QWEN35_SUPPORT)
     encode_layer_ = std::make_unique<op::QwenEncodeLayer>(this->token_path_, false, false);
 #endif
   }
