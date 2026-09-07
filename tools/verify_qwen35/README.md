@@ -20,15 +20,21 @@ prompt:
 ```bash
 python3 tools/export_qwen35/export.py \
   --model_dir /path/to/Qwen3.5-0.8B \
-  --output /tmp/qwen35-0.8b-fp32.bin \
-  --max_seq_len 128
+  --output /tmp/qwen35-0.8b-bf16.bin \
+  --max_seq_len 128 \
+  --weight_dtype bf16
 ```
+
+`bf16` is the default and stores embedding/projection matrices at half the
+FP32 size while retaining FP32 activations, accumulation, recurrent state, and
+small parameters. Use `--weight_dtype fp32` when a full-FP32 checkpoint is
+needed. The loader remains compatible with version-2 FP32 exports.
 
 ## Generate and compare traces
 
 ```bash
 ./build/demo/qwen35_trace \
-  /tmp/qwen35-0.8b-fp32.bin \
+  /tmp/qwen35-0.8b-bf16.bin \
   /path/to/Qwen3.5-0.8B/tokenizer.json \
   /tmp/qwen35-kuiper-trace
 

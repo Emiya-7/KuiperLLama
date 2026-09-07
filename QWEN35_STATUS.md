@@ -4,12 +4,13 @@
 
 本文记录已完成的设计与实现、已验证到什么程度、存在哪些缺陷，以及达成目标还差什么。
 
-**当前状态**：Qwen3.5-0.8B 真实权重的 CPU 文本推理已与 Transformers
-FP32/eager 实现逐层对齐；24 层 hidden state、最终 norm、完整 logits 以及前 10 个
-greedy token 均通过比较。当前共定义 47 个 GTest。CPU 专项与 tiny-model 端到端
-测试通过；本次环境无可用 CUDA 设备，CUDA 对比测试会自动 skip。
+**当前状态**：Qwen3.5-0.8B 的 FP32 和 BF16-matrix 两种真实权重路径均已在 CPU
+上与 Transformers FP32/eager 逐层对齐；24 层 hidden state、最终 norm、完整
+logits 以及前 10 个 greedy token 均通过比较。BF16 checkpoint 从 3.01 GB 降至
+1.51 GB。当前共定义 51 个 GTest；本次环境无可用 CUDA 设备，CUDA 对比测试会
+自动 skip，但全部新增 CUDA kernel 已通过编译。
 
-尚未完成的是 4B/9B 真实模型运行及其所需的低精度权重/算子支持，见「第 5 节」。
+尚未完成的是 4B/9B checkpoint 的本机端到端运行，见「第 5 节」。
 
 ---
 
@@ -192,9 +193,9 @@ cmake --build build -j$(nproc)
 
 **布局断言**：`create_param_layers()` 结尾有
 ```cpp
-CHECK_EQ(pos * sizeof(float) + sizeof(Qwen35RawConfig), raw_model_data_->file_size)
+CHECK_EQ(pos + header_size_, raw_model_data_->file_size)
 ```
-消耗的 float 数必须正好落在文件末尾。导出器与读取器一旦漂移立即失败，而不是读到垃圾数据后静默产出乱码。这是最有价值的一道防线。
+消耗的权重字节数必须正好落在文件末尾。导出器与读取器一旦漂移立即失败，而不是读到垃圾数据后静默产出乱码。这是最有价值的一道防线。
 
 **vocab 修正**：`create_encode_layer()` 会用 tokenizer 的 248044 覆盖 `config_->vocab_size_`，而 embedding 是 248320。在 `gen_model_from_file()` 里恢复为 header 值，否则采样会越界读。
 
@@ -204,11 +205,14 @@ CHECK_EQ(pos * sizeof(float) + sizeof(Qwen35RawConfig), raw_model_data_->file_si
 
 - 直读 safetensors，**不依赖 torch / transformers / numpy**（本机无 pip，这是必要约束）
 - 只取 `model.language_model.*`，按 `layer_types` 分流两类层
-- bf16→fp32 用字节切片赋值（走 C 层）：1.79GB→3.58GB 耗时 10.7s，外推 9B 约 3.5 分钟
+- `--weight_dtype bf16|fp32` 控制 embedding/二维投影矩阵的存储类型，默认 BF16；
+  norm、conv、decay 等小参数和全部运行时激活/状态仍保持 FP32
 - `--dry_run` 校验全部张量存在且形状正确，不写文件
 - 多 shard 懒加载，一次只驻留一个 shard 的 header
 
-磁盘格式（v2，magic `K35D`）：18 个 int32 + 2 个 float 的头，随后按 `create_param_layers` 的顺序排列 fp32 权重。原有 7-int `ModelConfig` 描述不了混合模型，故另立版本化格式而非扩展。
+磁盘格式 v3（magic `K35D`）：19 个 int32 + 2 个 float 的头，新增矩阵权重类型，
+随后按 `create_param_layers` 的顺序排列混合精度权重。读取器仍兼容全 FP32 的 v2
+checkpoint。原有 7-int `ModelConfig` 描述不了混合模型，故另立版本化格式。
 
 ### 3.5 初始接入时修改的既有文件（8 个，共 +52/-14 行）
 
@@ -222,7 +226,7 @@ CHECK_EQ(pos * sizeof(float) + sizeof(Qwen35RawConfig), raw_model_data_->file_si
 | `kuiper/include/op/encode.h`<br>`kuiper/source/op/encode.cpp`<br>`kuiper/source/model/model.cpp` | 宏条件加 `QWEN35_SUPPORT`，复用 `QwenEncodeLayer` | 新增 |
 
 初始接入未改动任何现有算子的实现或语义。阶段 3 另行修复了所有 GPT-2 byte-level
-BPE 共用的空格预处理错误，详见 4.7。
+BPE 共用的空格预处理错误，详见 4.8。
 
 ---
 
@@ -272,7 +276,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 
 ### 4.5 端到端（合成模型）
 
-`test/test_model/test_qwen35.cpp`，当前 10 个配置/模型测试，其中核心测试如下：
+`test/test_model/test_qwen35.cpp`，当前 11 个配置/模型测试，其中核心测试如下：
 
 | 测试 | 覆盖 |
 |---|---|
@@ -284,6 +288,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 | `Qwen35Tiny.SamplingSkipsEmbeddingPadding` | 保留有效特殊 token，排除 `[248070, 248320)` padding 行 |
 | `Qwen35Config.ReportsItsOwnModelType` | 模型类型不再误报为 Llama2 |
 | `Qwen35Config.RejectsZeroIntervalInModelHeader` | 非法 header 在派生尺寸前返回解析错误，不触发除零 |
+| `Qwen35Config.RejectsUnknownMatrixWeightType` | v3 header 中未知矩阵 dtype 返回解析错误 |
 | `Qwen35Tokenizer.MatchesTransformersChatPrompt` | 真实 tokenizer 对同一 chat prompt 的编码/解码与 Transformers 一致 |
 
 合成模型与 4B **同构**：真实 vocab 248320、head_dim 256、rotary_dim 64、interval 4、v:k=2:1、tie_word_embeddings —— 只缩小 hidden/inter/layers。生成器 [`test/test_model/make_tiny_qwen35.py`](test/test_model/make_tiny_qwen35.py) 已入库，可字节级复现。
@@ -294,8 +299,9 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 47 个 GTest。Qwen3.5 专项共 14 个；本次运行结果为 12 个通过，
-2 个 CUDA 对比因运行环境无可用设备而跳过。
+当前共定义 51 个 GTest。Qwen3.5 专项共 15 个；BF16 tiny checkpoint 下本次运行
+结果为 13 个通过，2 个 CUDA 对比因运行环境无可用设备而跳过。另有 Tensor BF16
+存储/转换、BF16 matmul 和 BF16 embedding 三个专项用例通过。
 
 ### 4.6 真实 Qwen3.5-0.8B 对 Transformers（阶段 3）
 
@@ -323,7 +329,29 @@ state、最终 norm、完整 logits 和前 10 个 greedy token。
 路径上的真实权重顺序、混合层调度、GDN 状态、full attention、RoPE、norm、MLP、
 KV cache 与自回归状态推进均已对齐，而不再只是合成权重自测。
 
-### 4.7 已发现并修复的实现错误
+### 4.7 BF16 权重路径（阶段 4）
+
+阶段 4 采用 **BF16 大矩阵存储 + FP32 激活、累加、KV cache 和 GDN state**：
+
+- `Tensor` 增加 BF16 dtype 和 CPU RNE 转换工具。
+- CPU/CUDA matmul 支持 FP32 输入、BF16 权重、FP32 累加和输出。
+- CPU/CUDA embedding 支持从 BF16 table 读取并输出 FP32。
+- v3 checkpoint 仅压缩 embedding 和全部二维投影；小参数保留 FP32。
+- tied embedding 在 CUDA 上只上传一次并与 LM head 共享，4B 避免额外约 1.27 GB。
+
+真实 0.8B 导出大小 `3.01 GB → 1.51 GB`。与同一 Transformers reference 比较：
+
+| 对比项 | BF16-matrix 结果 |
+|---|---|
+| decoder 层 0–23 | 最大绝对误差 `2.37823e-05` |
+| final norm | 最大绝对误差 `1.20163e-04`，相对误差 `3.06030e-06` |
+| 完整 logits | 最大绝对误差 `1.01328e-04`，平均绝对误差 `8.89898e-06` |
+| 前 10 个 greedy token | **完全一致** |
+
+这里的真实模型矩阵原本就是 BF16，因此并非重新量化造成的近似；误差主要来自
+Kuiper 标量/Armadillo 与 PyTorch 的 FP32 累加顺序不同。
+
+### 4.8 已发现并修复的实现错误
 
 **q_proj 的门拆分（严重）**。核对官方 `modeling_qwen3_5.py` 发现：
 
@@ -387,22 +415,26 @@ embedding 输出头。4B/9B 仍有两个只能由对应 checkpoint 最终确认�
   tiny-model 测试，但尚未跑真实 4B 权重。
 - 9B 使用独立 `lm_head`；导出和加载分支已实现，但尚未跑真实 9B 权重。
 
-两者当前首先受下面的 FP32 内存限制阻塞。
+4B 下载尝试已完成配置和 tokenizer，但本次网络对 9.32 GB 权重分片只能达到约
+0.1–0.5 MB/s，预计需数小时，因此保留断点续传文件、未把下载冒充成验证完成。
 
-### 5.2 显存/内存不足
+### 5.2 FP32 内存阻塞已解除，真实大模型仍待运行
 
 | 项 | 4B | 9B |
 |---|---|---|
 | 权重（fp32） | ~17 GB | ~36 GB |
+| 权重（BF16 matrix） | ~8.5 GB | ~18 GB |
 | KV cache（8 full 层，8192 ctx） | ~0.5 GB | ~0.5 GB |
 | GDN state（24 linear 层） | ~50 MB | ~50 MB |
 
 本机：**GPU 12 GB、系统内存 15 GB（swap 4 GB）**。
 
-- GPU 跑 4B fp32：**不可能**（17 GB > 12 GB）
-- CPU 跑 4B fp32：**也不够**（17 GB > 15 GB，会重度 swap）
+- GPU/CPU 跑 4B FP32：不可能或会重度 swap。
+- 4B BF16 matrix 预计约 8.5 GB；再加约 0.55 GB cache/state 和工作区，已进入
+  12 GB GPU/15 GB 系统内存的可运行范围。
+- 9B BF16 matrix 仍超过本机 GPU 和物理内存，需要 int8、更多内存或分层卸载。
 
-框架目前**只支持 fp32**。这是硬阻塞。
+CUDA 运行尚未实测，因为本次容器无法访问 GPU；当前保证到 CUDA 12.8/sm_89 编译通过。
 
 ### 5.3 prompt 阶段逐 token 串行
 
@@ -417,7 +449,7 @@ GDN 递推本身串行（官方的分块并行版 `torch_chunk_gated_delta_rule`
 | kernel launch 后普遍缺 `cudaGetLastError()` 检查 | 各处 | 低 |
 | `view()` 返回非拥有张量，无生命周期保护 | `qwen35.cpp` | 低（buffer 在 init 一次性分配） |
 | 导出器 F16 分支逐元素 `struct.unpack`，很慢 | `export.py` | 低（真实 checkpoint 是 BF16，不走该分支） |
-| 无 int8 量化（`create_param_quant_layers` 直接 FATAL） | — | 中（与 5.2 相关） |
+| 无 int8 量化（`create_param_quant_layers` 直接 FATAL） | — | 中（9B 本机运行仍需要） |
 | batch size 固定为 1 | 全框架既有限制 | 低 |
 | `max_seq_len` 导出时固定，运行时不可变 | — | 低 |
 
@@ -431,17 +463,17 @@ GDN 递推本身串行（官方的分块并行版 `torch_chunk_gated_delta_rule`
 
 0.8B FP32 已完成逐层、logits 和 10-token greedy 对齐，结果见 4.6。
 
-### 步骤 2：解决 4B/9B 内存（下一阻塞项）
+### 步骤 2：解决 4B 内存（阶段 4，已完成）
 
 fp32 的 4B 需要 17 GB，本机 GPU 12 GB、内存 15 GB，两条路都不通。三个选项：
 
 | 方案 | 工作量 | 说明 |
 |---|---|---|
-| **A. 加 bf16/fp16 权重支持** | 大 | 4B 降到 ~8.5 GB，可放进 12 GB GPU。需要改 Tensor 的 dtype 体系、全部 matmul kernel、导出器。**一劳永逸，推荐** |
+| **A. 加 BF16 权重支持（已完成）** | 大 | embedding/投影约减半至 ~8.5 GB；Tensor、CPU/CUDA matmul、embedding、导出器和 v3 loader 已接入 |
 | **B. 先用 0.8B 验证正确性（已完成）** | 小 | 0.8B fp32 ≈ 3.4 GB；阶段 3 已验证权重顺序、RoPE、GDN 和生成状态 |
 | C. CPU + mmap 惰性加载 | 中 | 靠 mmap 让 OS 按需换页，能跑但极慢；15 GB 内存下仍会 swap |
 
-方案 B 已在阶段 3 完成。下一阶段应实施方案 A，再运行 4B/9B 的真实权重验证。
+方案 A 的 BF16 weight-only 路径已在阶段 4 完成；方案 B 已在阶段 3 完成。
 
 注：0.8B 是 `nk=16/nv=16`（1:1），4B/9B 是 2:1。两者都要测到才算覆盖分组路径 —— 分组逻辑已在算子级用 4B 尺寸验证过（4.2、4.3），但端到端只测了合成模型。
 
@@ -456,7 +488,7 @@ huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir ~/models/Qwen3.5-0.8B
 python3 tools/export_qwen35/export.py --model_dir ~/models/Qwen3.5-0.8B \
         --output ~/models/qwen35_0.8b.bin --max_seq_len 4096 --dry_run
 python3 tools/export_qwen35/export.py --model_dir ~/models/Qwen3.5-0.8B \
-        --output ~/models/qwen35_0.8b.bin --max_seq_len 4096
+        --output ~/models/qwen35_0.8b.bin --max_seq_len 4096 --weight_dtype bf16
 
 # 3. 生成两侧 trace 并比较
 source tools/env.sh
@@ -480,7 +512,8 @@ python3 tools/verify_qwen35/compare_traces.py \
 
 ### 步骤 5：跑 4B/9B
 
-依赖步骤 2A（bf16）。9B 无 tie_word_embeddings、有独立 `lm_head`，导出器已处理该分支但未实测。
+4B 依赖权重下载完成后续传并实测。9B 无 tie_word_embeddings、有独立 `lm_head`，
+且 BF16 仍约 18 GB；导出器已处理该分支但本机运行还需 int8 或更多内存。
 
 ### 步骤 6（可选）：性能
 
@@ -496,6 +529,7 @@ python3 tools/verify_qwen35/compare_traces.py \
 
 ```
 kuiper/include/model/qwen35_config.h            磁盘头 + 运行时配置
+kuiper/include/base/bfloat16.h                  CPU BF16 转换工具
 kuiper/include/model/qwen35.h                   模型类
 kuiper/include/op/qwen35_ops.h                 10 个 Layer 声明
 kuiper/source/model/qwen35.cpp                  权重加载 + forward
@@ -505,7 +539,7 @@ kuiper/source/op/kernels/cpu/qwen35_kernel.cpp  CPU kernel 实现
 kuiper/source/op/kernels/cuda/qwen35_kernel.cuh CUDA kernel 声明
 kuiper/source/op/kernels/cuda/qwen35_kernel.cu  CUDA kernel 实现
 demo/main_qwen35.cpp                            推理 demo
-test/test_model/test_qwen35.cpp                 10 个配置/模型测试
+test/test_model/test_qwen35.cpp                 11 个配置/模型测试
 test/test_model/make_tiny_qwen35.py             合成模型生成器
 tools/export_qwen35/export.py                   导出器
 tools/verify_qwen35/kuiper_trace.cpp            Kuiper 逐层 trace 与 10-token 生成
