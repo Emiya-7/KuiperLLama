@@ -22,6 +22,32 @@ namespace {
 const char* tiny_model_path() { return std::getenv("KUIPER_TINY_QWEN35"); }
 const char* tiny_token_path() { return std::getenv("KUIPER_TINY_QWEN35_TOKENIZER"); }
 
+model::Qwen35RawConfig valid_raw_config() {
+  model::Qwen35RawConfig raw{};
+  raw.magic = model::kQwen35Magic;
+  raw.version = model::kQwen35Version;
+  raw.hidden_size = 8;
+  raw.intermediate_size = 16;
+  raw.layer_num = 4;
+  raw.vocab_size = 32;
+  raw.max_seq_len = 8;
+  raw.head_num = 1;
+  raw.kv_head_num = 1;
+  raw.head_dim = 8;
+  raw.rotary_dim = 2;
+  raw.full_attention_interval = 4;
+  raw.linear_num_k_heads = 1;
+  raw.linear_num_v_heads = 1;
+  raw.linear_k_head_dim = 4;
+  raw.linear_v_head_dim = 4;
+  raw.conv_kernel_size = 4;
+  raw.tie_word_embeddings = 1;
+  raw.matrix_weight_type = static_cast<int32_t>(model::Qwen35MatrixWeightType::kFp32);
+  raw.rope_theta = 10000.f;
+  raw.rms_norm_eps = 1e-6f;
+  return raw;
+}
+
 class Qwen35Tiny : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -104,26 +130,8 @@ TEST(Qwen35Config, RejectsZeroIntervalInModelHeader) {
   const int fd = mkstemp(path);
   ASSERT_NE(fd, -1);
 
-  model::Qwen35RawConfig raw{};
-  raw.magic = model::kQwen35Magic;
-  raw.version = model::kQwen35Version;
-  raw.hidden_size = 8;
-  raw.intermediate_size = 16;
-  raw.layer_num = 1;
-  raw.vocab_size = 32;
-  raw.max_seq_len = 8;
-  raw.head_num = 1;
-  raw.kv_head_num = 1;
-  raw.head_dim = 8;
-  raw.rotary_dim = 2;
+  model::Qwen35RawConfig raw = valid_raw_config();
   raw.full_attention_interval = 0;  // used to divide before being validated
-  raw.linear_num_k_heads = 1;
-  raw.linear_num_v_heads = 1;
-  raw.linear_k_head_dim = 4;
-  raw.linear_v_head_dim = 4;
-  raw.conv_kernel_size = 4;
-  raw.rope_theta = 10000.f;
-  raw.rms_norm_eps = 1e-6f;
 
   const ssize_t written = write(fd, &raw, sizeof(raw));
   close(fd);
@@ -134,6 +142,25 @@ TEST(Qwen35Config, RejectsZeroIntervalInModelHeader) {
   EXPECT_FALSE(status);
   EXPECT_EQ(status.get_err_code(), base::StatusCode::kModelParseError);
   EXPECT_NE(status.get_err_msg().find("full_attention_interval"), std::string::npos);
+  EXPECT_EQ(std::remove(path), 0);
+}
+
+TEST(Qwen35Config, RejectsUnknownMatrixWeightType) {
+  char path[] = "/tmp/kuiper_qwen35_dtype_XXXXXX";
+  const int fd = mkstemp(path);
+  ASSERT_NE(fd, -1);
+
+  model::Qwen35RawConfig raw = valid_raw_config();
+  raw.matrix_weight_type = 99;
+  const ssize_t written = write(fd, &raw, sizeof(raw));
+  close(fd);
+  ASSERT_EQ(written, static_cast<ssize_t>(sizeof(raw)));
+
+  model::Qwen35Model qwen35(base::TokenizerType::kEncodeBpe, "unused-tokenizer", path, false);
+  const base::Status status = qwen35.init(base::DeviceType::kDeviceCPU);
+  EXPECT_FALSE(status);
+  EXPECT_EQ(status.get_err_code(), base::StatusCode::kModelParseError);
+  EXPECT_NE(status.get_err_msg().find("weight type"), std::string::npos);
   EXPECT_EQ(std::remove(path), 0);
 }
 
