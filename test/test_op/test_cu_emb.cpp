@@ -3,6 +3,25 @@
 #include <gtest/gtest.h>
 #include "../source/op/kernels/kernels_interface.h"
 #include "base/buffer.h"
+#include "base/bfloat16.h"
+
+TEST(test_emb_bf16, converts_selected_rows_to_fp32_on_cpu) {
+  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+  tensor::Tensor tokens(base::DataType::kDataTypeInt32, 2, true, alloc_cpu);
+  tensor::Tensor weight(base::DataType::kDataTypeBf16, 3, 4, true, alloc_cpu);
+  tensor::Tensor output(base::DataType::kDataTypeFp32, 2, 4, true, alloc_cpu);
+  tokens.index<int32_t>(0) = 2;
+  tokens.index<int32_t>(1) = 0;
+  for (int32_t i = 0; i < 12; ++i) {
+    weight.index<uint16_t>(i) = base::float_to_bfloat16(static_cast<float>(i) / 2.f);
+  }
+
+  kernel::get_emb_kernel(base::DeviceType::kDeviceCPU)(tokens, weight, output, 3, nullptr);
+  for (int32_t i = 0; i < 4; ++i) {
+    EXPECT_FLOAT_EQ(output.index<float>(i), static_cast<float>(8 + i) / 2.f);
+    EXPECT_FLOAT_EQ(output.index<float>(4 + i), static_cast<float>(i) / 2.f);
+  }
+}
 TEST(test_emb_cu, emb1_nostream) {
   auto alloc_cu = base::CUDADeviceAllocatorFactory::get_instance();
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
