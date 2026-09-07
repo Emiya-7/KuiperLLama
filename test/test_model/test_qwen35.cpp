@@ -1,4 +1,5 @@
 #ifdef QWEN35_SUPPORT
+#include <cuda_runtime.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <cmath>
@@ -267,6 +268,13 @@ TEST_F(Qwen35Tiny, ResetStateMakesRunsReproducible) {
 // the kernel-level tests cannot: buffer wiring, the recurrent-state slicing per
 // linear layer, and KV-cache addressing by full-layer ordinal.
 TEST_F(Qwen35Tiny, CudaMatchesCpu) {
+  int device_count = 0;
+  const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+  if (device_status != cudaSuccess || device_count == 0) {
+    cudaGetLastError();
+    GTEST_SKIP() << "CUDA device unavailable";
+  }
+
   auto logits_for = [](base::DeviceType device) {
     model::Qwen35Model model(base::TokenizerType::kEncodeBpe, tiny_token_path(),
                              tiny_model_path(), false);
