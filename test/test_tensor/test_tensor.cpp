@@ -4,6 +4,24 @@
 #include <tensor/tensor.h>
 #include "../utils.cuh"
 #include "base/buffer.h"
+#include "base/bfloat16.h"
+
+TEST(test_tensor, bf16_storage_and_conversion) {
+  using namespace base;
+  auto alloc_cpu = CPUDeviceAllocatorFactory::get_instance();
+  tensor::Tensor values(DataType::kDataTypeBf16, 4, true, alloc_cpu);
+
+  ASSERT_EQ(values.byte_size(), 4 * sizeof(uint16_t));
+  const float input[4] = {1.0f, -2.0f, 3.140625f, 0.33333334f};
+  for (int i = 0; i < 4; ++i) {
+    values.index<uint16_t>(i) = float_to_bfloat16(input[i]);
+  }
+
+  EXPECT_FLOAT_EQ(bfloat16_to_float(values.index<uint16_t>(0)), 1.0f);
+  EXPECT_FLOAT_EQ(bfloat16_to_float(values.index<uint16_t>(1)), -2.0f);
+  EXPECT_FLOAT_EQ(bfloat16_to_float(values.index<uint16_t>(2)), 3.140625f);
+  EXPECT_NEAR(bfloat16_to_float(values.index<uint16_t>(3)), input[3], 1e-3f);
+}
 
 TEST(test_tensor, to_cpu) {
   using namespace base;
