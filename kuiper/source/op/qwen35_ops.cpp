@@ -232,17 +232,21 @@ base::Status GatedDeltaLayer::check() const {
   }
   auto st = expect_device(get_output(0), device_type_, "GatedDelta output");
   if (!st) return st;
-  if (num_k_heads_ == 0 || num_v_heads_ % num_k_heads_ != 0) {
-    return base::error::InvalidArgument("num_v_heads is not a multiple of num_k_heads.");
+  if (num_k_heads_ <= 0 || num_v_heads_ <= 0 || num_v_heads_ % num_k_heads_ != 0) {
+    return base::error::InvalidArgument(
+        "num_k_heads and num_v_heads must be positive, with v heads grouped by k heads.");
   }
-  const int32_t k_dim = num_k_heads_ * k_head_dim_;
-  const int32_t v_dim = num_v_heads_ * v_head_dim_;
-  if (static_cast<int32_t>(get_input(0).size()) != k_dim ||
-      static_cast<int32_t>(get_input(1).size()) != k_dim) {
+  if (k_head_dim_ <= 0 || v_head_dim_ <= 0) {
+    return base::error::InvalidArgument("GatedDelta head dimensions must be positive.");
+  }
+  const int64_t k_dim = static_cast<int64_t>(num_k_heads_) * k_head_dim_;
+  const int64_t v_dim = static_cast<int64_t>(num_v_heads_) * v_head_dim_;
+  if (static_cast<int64_t>(get_input(0).size()) != k_dim ||
+      static_cast<int64_t>(get_input(1).size()) != k_dim) {
     return base::error::InvalidArgument("GatedDelta q/k size != num_k_heads * k_head_dim.");
   }
-  if (static_cast<int32_t>(get_input(2).size()) != v_dim ||
-      static_cast<int32_t>(get_output(0).size()) != v_dim) {
+  if (static_cast<int64_t>(get_input(2).size()) != v_dim ||
+      static_cast<int64_t>(get_output(0).size()) != v_dim) {
     return base::error::InvalidArgument("GatedDelta v/out size != num_v_heads * v_head_dim.");
   }
   if (static_cast<int32_t>(get_input(3).size()) != num_v_heads_ ||

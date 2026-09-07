@@ -122,6 +122,11 @@ class Qwen35Model : public Model {
   // GDN state accumulates and would otherwise leak across sequences.
   void reset_state() const;
 
+ protected:
+  // Kept protected, matching Model, so focused model tests can exercise the
+  // tokenizer-bounded sampling path without running another forward pass.
+  int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const override;
+
  private:
   void init_mem() override;
 
@@ -146,8 +151,6 @@ class Qwen35Model : public Model {
   void feed_forward(int32_t layer_idx, const tensor::Tensor& input) const;
 
   void cls_logits(const tensor::Tensor& input) const;
-
-  int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const override;
 
   tensor::Tensor& q35_buffer(Qwen35Buffer idx) const;
 

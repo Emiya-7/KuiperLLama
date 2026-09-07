@@ -2,8 +2,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unistd.h>
 #include "model/qwen35.h"
 
 // These exercise the hybrid plumbing on a small synthetic checkpoint written by
@@ -24,6 +26,21 @@ class Qwen35Tiny : public ::testing::Test {
     if (!tiny_model_path() || !tiny_token_path()) {
       GTEST_SKIP() << "set KUIPER_TINY_QWEN35 and KUIPER_TINY_QWEN35_TOKENIZER to run";
     }
+  }
+};
+
+class TestableQwen35Model : public model::Qwen35Model {
+ public:
+  using Qwen35Model::Qwen35Model;
+
+  int32_t tokenizer_vocab_size_for_test() const {
+    CHECK(encode_layer_ != nullptr);
+    return encode_layer_->vocab_size();
+  }
+
+  int32_t sample_for_test() const {
+    tensor::Tensor unused_pos(base::DataType::kDataTypeInt32, 1);
+    return post_processing(unused_pos, false);
   }
 };
 
@@ -65,6 +82,59 @@ TEST(Qwen35Config, LayerTypeAndLocalIndex) {
   EXPECT_EQ(c.kv_mul, 4);
 }
 
+TEST(Qwen35Config, ReportsItsOwnModelType) {
+  model::Qwen35Model model(base::TokenizerType::kEncodeBpe, "unused-tokenizer", "unused-model",
+                           false);
+  EXPECT_EQ(model.model_type(), base::ModelType::kModelTypeQwen35);
+}
+
+TEST(Qwen35Config, InvalidIntervalDoesNotDivideByZeroDuringDerivation) {
+  model::Qwen35Config c;
+  c.layer_num = 8;
+  c.full_attention_interval = 0;
+  c.derive();
+  EXPECT_EQ(c.full_layer_num, 0);
+  EXPECT_EQ(c.linear_layer_num, 8);
+}
+
+TEST(Qwen35Config, RejectsZeroIntervalInModelHeader) {
+  char path[] = "/tmp/kuiper_qwen35_invalid_XXXXXX";
+  const int fd = mkstemp(path);
+  ASSERT_NE(fd, -1);
+
+  model::Qwen35RawConfig raw{};
+  raw.magic = model::kQwen35Magic;
+  raw.version = model::kQwen35Version;
+  raw.hidden_size = 8;
+  raw.intermediate_size = 16;
+  raw.layer_num = 1;
+  raw.vocab_size = 32;
+  raw.max_seq_len = 8;
+  raw.head_num = 1;
+  raw.kv_head_num = 1;
+  raw.head_dim = 8;
+  raw.rotary_dim = 2;
+  raw.full_attention_interval = 0;  // used to divide before being validated
+  raw.linear_num_k_heads = 1;
+  raw.linear_num_v_heads = 1;
+  raw.linear_k_head_dim = 4;
+  raw.linear_v_head_dim = 4;
+  raw.conv_kernel_size = 4;
+  raw.rope_theta = 10000.f;
+  raw.rms_norm_eps = 1e-6f;
+
+  const ssize_t written = write(fd, &raw, sizeof(raw));
+  close(fd);
+  ASSERT_EQ(written, static_cast<ssize_t>(sizeof(raw)));
+
+  model::Qwen35Model qwen35(base::TokenizerType::kEncodeBpe, "unused-tokenizer", path, false);
+  const base::Status status = qwen35.init(base::DeviceType::kDeviceCPU);
+  EXPECT_FALSE(status);
+  EXPECT_EQ(status.get_err_code(), base::StatusCode::kModelParseError);
+  EXPECT_NE(status.get_err_msg().find("full_attention_interval"), std::string::npos);
+  EXPECT_EQ(std::remove(path), 0);
+}
+
 // Loading is where an export/reader layout drift would show up: create_param_layers
 // asserts that the offsets it walks land exactly on the end of the file.
 TEST_F(Qwen35Tiny, LoadsOnCpu) {
@@ -79,6 +149,30 @@ TEST_F(Qwen35Tiny, LoadsOnCpu) {
   EXPECT_EQ(c.rotary_dim, c.head_dim / 4);  // partial_rotary_factor 0.25
   EXPECT_GT(c.linear_layer_num, 0);
   EXPECT_GT(c.full_layer_num, 0);
+}
+
+// Qwen3.5 pads the embedding/logit matrix beyond the tokenizer's valid IDs.
+// A padding row may have the largest logit but must never be returned as a
+// generated token; valid special tokens at the end of the tokenizer stay in
+// the sampling range.
+TEST_F(Qwen35Tiny, SamplingSkipsEmbeddingPadding) {
+  TestableQwen35Model model(base::TokenizerType::kEncodeBpe, tiny_token_path(),
+                            tiny_model_path(), false);
+  ASSERT_TRUE(model.init(base::DeviceType::kDeviceCPU));
+
+  const int32_t token_limit = model.tokenizer_vocab_size_for_test();
+  auto& logits = model.get_buffer(model::ModelBufferType::kForwardOutput);
+  ASSERT_GT(token_limit, 0);
+  EXPECT_EQ(token_limit, 248070);  // 248044 base tokens + 26 valid special tokens
+  ASSERT_LT(static_cast<size_t>(token_limit), logits.size());
+
+  for (size_t i = 0; i < logits.size(); ++i) {
+    logits.index<float>(static_cast<int32_t>(i)) = -10.f;
+  }
+  logits.index<float>(token_limit - 1) = 1.f;
+  logits.index<float>(token_limit) = 100.f;  // first padded embedding row
+
+  EXPECT_EQ(model.sample_for_test(), token_limit - 1);
 }
 
 // A forward pass over both layer kinds must produce finite logits. NaNs here

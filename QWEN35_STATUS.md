@@ -5,8 +5,9 @@
 本文记录已完成的设计与实现、已验证到什么程度、存在哪些缺陷，以及达成目标还差什么。
 
 **当前状态**：推理骨架已打通；已修正 Qwen3.5 zero-centered RMSNorm 语义，
-当前共定义 42 个 GTest（新增 3 个专用 norm 测试）。CPU 专项与 tiny-model
-端到端测试通过；本次环境无可用 CUDA 设备，新增 CUDA 对比测试会自动 skip。
+当前共定义 47 个 GTest（阶段 1 新增 3 个 norm 测试，阶段 2 新增 5 个安全性
+测试）。CPU 专项与 tiny-model 端到端测试通过；本次环境无可用 CUDA 设备，
+新增 CUDA 对比测试会自动 skip。
 **但尚未用真实权重验证过** —— 见「第 5 节 关键缺口」。
 
 ---
@@ -101,7 +102,8 @@ Qwen3.5 把投影拆成独立的 `in_proj_qkv/z/a/b`（Qwen3-Next 是融合的 `
 ### 1.5 其他
 
 - `tie_word_embeddings`: 0.8B/2B/4B 为 true（无 `lm_head`，复用 embedding）；9B 为 false
-- `vocab_size: 248320`，但 tokenizer.json 只有 **248044** 个 token（embedding 有 padding）
+- `vocab_size: 248320`；tokenizer 有 **248044** 个基础 token 和 26 个特殊 token，
+  有效 ID 连续覆盖 `[0, 248070)`，其余 embedding 行是 padding
 - `rms_norm_eps: 1e-6`，MLP 仍是 SwiGLU
 - `max_position_embeddings: 262144`
 - 特殊 token：`<|im_start|>=248045`、`<|im_end|>=248046`、`<|endoftext|>=248044`
@@ -268,7 +270,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 
 ### 4.5 端到端（合成模型）
 
-`test/test_model/test_qwen35.cpp`，5 个模型测试：
+`test/test_model/test_qwen35.cpp`，当前 10 个配置/模型测试，其中端到端核心测试如下：
 
 | 测试 | 覆盖 |
 |---|---|
@@ -277,6 +279,9 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 | `Qwen35Tiny.ForwardProducesFiniteLogits` | 两类层都跑通，logits 无 NaN/Inf |
 | `Qwen35Tiny.ResetStateMakesRunsReproducible` | GDN 状态清零正确，重放逐位一致 |
 | `Qwen35Tiny.CudaMatchesCpu` | CPU/CUDA 端到端相对误差 **<2e-3** |
+| `Qwen35Tiny.SamplingSkipsEmbeddingPadding` | 保留有效特殊 token，排除 `[248070, 248320)` padding 行 |
+| `Qwen35Config.ReportsItsOwnModelType` | 模型类型不再误报为 Llama2 |
+| `Qwen35Config.RejectsZeroIntervalInModelHeader` | 非法 header 在派生尺寸前返回解析错误，不触发除零 |
 
 合成模型与 4B **同构**：真实 vocab 248320、head_dim 256、rotary_dim 64、interval 4、v:k=2:1、tie_word_embeddings —— 只缩小 hidden/inter/layers。生成器 [`test/test_model/make_tiny_qwen35.py`](test/test_model/make_tiny_qwen35.py) 已入库，可字节级复现。
 
@@ -286,8 +291,9 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 42 个 GTest。本次阶段 1 验证中，3 个 CPU/config 专项测试和 3 个
-tiny-model CPU 端到端测试通过，CUDA 专项因运行环境无可用设备而跳过。
+当前共定义 47 个 GTest。阶段 2 新增的 5 个专项测试全部通过；连同阶段 1 回归和
+tiny-model CPU 端到端验证，本次运行 12 个测试，11 个通过，1 个 CUDA norm
+对比因运行环境无可用设备而跳过。
 
 ### 4.6 已发现并修复的实现错误
 
@@ -320,6 +326,19 @@ RMSNorm 会使用 `1e-5`，不是配置中的 `1e-6`。现已新增专用
 
 合成模型也已同步修正：普通 norm 权重在 0 附近，GDN gated norm 权重在 1 附近，
 避免继续用错误的合成权重掩盖该问题。
+
+**阶段 2 安全性修复（已完成）**。
+
+- CPU GDN 的固定 `float delta[512]` 改为按 `v_head_dim` 分配的一行复用缓冲，
+  不再静默忽略第 512 列之后的 state/output；新增 513 维回归测试。
+- Qwen3.5 采样上界改为 tokenizer 的有效 ID 数 248070，而 logits/embedding
+  仍保持 248320 宽；因此特殊 token 248044–248069 可正常生成，padding 行不会
+  被选中。
+- 新增 `kModelTypeQwen35`，模型不再复用 `kModelTypeLLama2`。
+- 模型文件头的所有除数和关键尺寸在 `derive()` 前校验，并给 `derive()` 的 interval
+  增加防御性保护，非法文件返回 `kModelParseError` 而不是触发除零。
+- CUDA argmax 的异步 D2H copy 现在会在读取栈上结果前同步 stream，并释放每次
+  采样申请的 device index，避免结果竞争和逐 token allocator 泄漏。
 
 ---
 
@@ -359,9 +378,6 @@ GDN 递推本身串行（官方的分块并行版 `torch_chunk_gated_delta_rule`
 
 | 问题 | 位置 | 严重性 |
 |---|---|---|
-| `gated_delta_step_cpu` 用固定栈数组 `float delta[512]`，`v_head_dim>512` 会**静默算错**而非报错 | `cpu/qwen35_kernel.cpp` | 中（当前所有型号 vd=128，但缺防护） |
-| `model_type_` 复用了 `kModelTypeLLama2`，未新增枚举 → `model_type()` 报告错误 | `qwen35.cpp` 构造函数 | 低（仅信息性） |
-| 采样可能命中 embedding padding 对应的无效 token id；不能从 `248044` 起简单截断，因为其后仍存在有效特殊 token | `post_processing` | 中（需按 tokenizer 的实际有效 ID 集合构造 mask） |
 | conv state 每步 O(k) 左移，未用环形缓冲 | `causal_conv1d_decode` | 低（k=4） |
 | `gated_delta_step_cu` 两趟扫描 state，可融合减少一半访存 | `cuda/qwen35_kernel.cu` | 低（性能） |
 | kernel launch 后普遍缺 `cudaGetLastError()` 检查 | 各处 | 低 |
@@ -423,11 +439,12 @@ export LD_LIBRARY_PATH=$PWD/lib:$LD_LIBRARY_PATH
 
 预期会踩的坑（基于 4.6 的经验）：权重顺序、RoPE 相位、门拆分这三类最容易出错，且**只有真实权重能暴露**。zero-centered RMSNorm 已有专项测试，但仍需在真实逐层对齐中确认。
 
-### 步骤 3：修掉 5.4 中危项
+### 步骤 3：修掉 5.4 中危项（阶段 2 已完成）
 
-- `float delta[512]` 换成动态分配或加 `CHECK`（静默算错比崩溃更危险）
-- logits 超出 tokenizer vocab 的部分 mask 掉
-- 加 `kModelTypeQwen35` 枚举
+- `float delta[512]` 已换成按实际 `v_head_dim` 分配的一行复用缓冲
+- 采样范围已限制到 tokenizer 的 248070 个连续有效 ID
+- 已增加 `kModelTypeQwen35` 枚举
+- 额外完成非法模型头的前置校验和 CUDA argmax 同步/allocator 释放
 
 ### 步骤 4：跑 4B/9B
 

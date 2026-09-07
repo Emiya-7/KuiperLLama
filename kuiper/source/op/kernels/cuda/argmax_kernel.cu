@@ -82,7 +82,11 @@ size_t argmax_kernel_cu(const float* input_ptr, size_t size, void* stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     argmax_kernel_fp32<<<1, 512, 0, stream_>>>(input_ptr, size, index);
     cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
+    // output_index is host memory. It cannot be read (or its stack storage go
+    // out of scope) until the asynchronous copy has completed.
+    cudaStreamSynchronize(stream_);
   }
+  alloc_cu->release(index);
   return output_index;
 }
 }  // namespace kernel

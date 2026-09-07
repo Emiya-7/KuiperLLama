@@ -7,6 +7,7 @@
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
 #include <op/mha.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -66,7 +67,7 @@ void Qwen35Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
 
 Qwen35Model::Qwen35Model(base::TokenizerType tokenizer_type, std::string token_path,
                          std::string model_path, bool is_quant_model)
-    : Model(tokenizer_type, base::ModelType::kModelTypeLLama2, std::move(token_path),
+    : Model(tokenizer_type, base::ModelType::kModelTypeQwen35, std::move(token_path),
             std::move(model_path), is_quant_model) {}
 
 tensor::Tensor& Qwen35Model::q35_buffer(Qwen35Buffer idx) const {
@@ -131,6 +132,35 @@ base::Status Qwen35Model::read_model_file() {
     close(fd);
     return error::ModelParseError("Unsupported Qwen3.5 model file version.");
   }
+  // Validate every divisor before deriving dimensions. In particular,
+  // Qwen35Config::derive() divides by full_attention_interval, so checking it
+  // afterwards would let a malformed header terminate the process first.
+  if (raw.hidden_size <= 0 || raw.intermediate_size <= 0 || raw.layer_num <= 0 ||
+      raw.vocab_size <= 0 || raw.max_seq_len <= 0) {
+    close(fd);
+    return error::ModelParseError("Qwen3.5 model dimensions must be positive.");
+  }
+  if (raw.head_num <= 0 || raw.kv_head_num <= 0 || raw.head_num % raw.kv_head_num != 0 ||
+      raw.head_dim <= 0) {
+    close(fd);
+    return error::ModelParseError(
+        "head_num must be a positive multiple of kv_head_num and head_dim must be positive.");
+  }
+  if (raw.rotary_dim <= 0 || raw.rotary_dim > raw.head_dim || raw.rotary_dim % 2 != 0) {
+    close(fd);
+    return error::ModelParseError("rotary_dim must be positive, even, and no larger than head_dim.");
+  }
+  if (raw.full_attention_interval <= 0) {
+    close(fd);
+    return error::ModelParseError("full_attention_interval must be positive.");
+  }
+  if (raw.linear_num_k_heads <= 0 || raw.linear_num_v_heads <= 0 ||
+      raw.linear_num_v_heads % raw.linear_num_k_heads != 0 || raw.linear_k_head_dim <= 0 ||
+      raw.linear_v_head_dim <= 0 || raw.conv_kernel_size <= 0) {
+    close(fd);
+    return error::ModelParseError(
+        "Qwen3.5 linear-attention dimensions are invalid or v heads are not grouped by k heads.");
+  }
 
   q35_.hidden_size = raw.hidden_size;
   q35_.intermediate_size = raw.intermediate_size;
@@ -151,16 +181,6 @@ base::Status Qwen35Model::read_model_file() {
   q35_.rope_theta = raw.rope_theta;
   q35_.rms_norm_eps = raw.rms_norm_eps;
   q35_.derive();
-
-  if (q35_.full_attention_interval <= 0) {
-    close(fd);
-    return error::ModelParseError("full_attention_interval must be positive.");
-  }
-  if (q35_.linear_num_k_heads <= 0 ||
-      q35_.linear_num_v_heads % q35_.linear_num_k_heads != 0) {
-    close(fd);
-    return error::ModelParseError("linear_num_v_heads must be a multiple of linear_num_k_heads.");
-  }
 
   // The base class's config_ drives shared plumbing (sampler, encode layer), so
   // fill in the fields those paths read. dim_/kv_dim_ deliberately describe the
@@ -213,10 +233,10 @@ base::Status Qwen35Model::gen_model_from_file() {
   if (!status) {
     return status;
   }
-  // create_encode_layer sets config_->vocab_size_ from the tokenizer, which for
-  // Qwen3.5 reports fewer entries (248044) than the padded embedding matrix
-  // (248320). The logits width follows the weights, so restore the header value;
-  // otherwise sampling would read past the end of the row it was given.
+  // create_encode_layer sets config_->vocab_size_ from the tokenizer (248070
+  // valid base + special token IDs for the current Qwen3.5 tokenizer), while
+  // the embedding/logit matrix is padded to 248320. Restore the tensor width;
+  // post_processing separately limits sampling to the tokenizer range.
   config_->vocab_size_ = q35_.vocab_size;
   return create_layers();
 }
@@ -808,7 +828,12 @@ int32_t Qwen35Model::post_processing(const tensor::Tensor& pos, bool is_prompt) 
   if (is_prompt) {
     return -1;
   }
-  return static_cast<int32_t>(sampler_->sample(forward_output.ptr<float>(), forward_output.size(),
+  CHECK(encode_layer_ != nullptr);
+  const int32_t tokenizer_vocab_size = encode_layer_->vocab_size();
+  CHECK_GT(tokenizer_vocab_size, 0);
+  const size_t sample_size =
+      std::min(forward_output.size(), static_cast<size_t>(tokenizer_vocab_size));
+  return static_cast<int32_t>(sampler_->sample(forward_output.ptr<float>(), sample_size,
                                                cuda_config_ ? cuda_config_->stream : nullptr));
 }
 
