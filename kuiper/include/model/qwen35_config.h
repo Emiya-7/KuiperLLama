@@ -123,7 +123,7 @@ struct Qwen35Config {
     state_size = linear_num_v_heads * linear_k_head_dim * linear_v_head_dim;
     conv_state_size = conv_dim * (conv_kernel_size - 1);
 
-    full_layer_num = layer_num / full_attention_interval;
+    full_layer_num = full_attention_interval > 0 ? layer_num / full_attention_interval : 0;
     linear_layer_num = layer_num - full_layer_num;
   }
 };

@@ -1,5 +1,6 @@
 #include "qwen35_kernel.h"
 #include <cmath>
+#include <vector>
 
 namespace kernel {
 
@@ -133,6 +134,10 @@ void gated_delta_step_cpu(const float* q, const float* k, const float* v, const 
   const int32_t v_per_k = num_v_heads / num_k_heads;
   const float q_scale = 1.f / std::sqrt(static_cast<float>(k_head_dim));
   const int32_t state_stride = k_head_dim * v_head_dim;
+  // One scratch row is enough for all heads. A dynamic buffer avoids the old
+  // fixed 512-element limit, which silently skipped state/output columns when
+  // a future model used v_head_dim > 512.
+  std::vector<float> delta(static_cast<size_t>(v_head_dim));
 
   for (int32_t h = 0; h < num_v_heads; ++h) {
     const int32_t kh = h / v_per_k;
@@ -161,24 +166,21 @@ void gated_delta_step_cpu(const float* q, const float* k, const float* v, const 
         out_h[j] += ki * srow[j] * decay;
       }
     }
-    // delta = (v - kv_mem) * beta, held in a small stack buffer so out_h can be
-    // rewritten as the query read below. v_head_dim is 128 for every published
-    // Qwen3.5 size; the assert-free bound keeps this a fixed frame.
-    float delta[512];
-    const int32_t vd = v_head_dim < 512 ? v_head_dim : 512;
-    for (int32_t j = 0; j < vd; ++j) {
+    // delta = (v - kv_mem) * beta. It must remain available while out_h is
+    // rewritten as the query read below.
+    for (int32_t j = 0; j < v_head_dim; ++j) {
       delta[j] = (v_h[j] - out_h[j]) * beta_h;
     }
 
     // S = S * decay + outer(k, delta), then out = S^T q in the same sweep.
-    for (int32_t j = 0; j < vd; ++j) {
+    for (int32_t j = 0; j < v_head_dim; ++j) {
       out_h[j] = 0.f;
     }
     for (int32_t i = 0; i < k_head_dim; ++i) {
       float* srow = S + static_cast<int64_t>(i) * v_head_dim;
       const float ki = k_h[i];
       const float qi = q_h[i] * q_scale;
-      for (int32_t j = 0; j < vd; ++j) {
+      for (int32_t j = 0; j < v_head_dim; ++j) {
         const float s = srow[j] * decay + ki * delta[j];
         srow[j] = s;
         out_h[j] += qi * s;
