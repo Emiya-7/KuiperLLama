@@ -4,11 +4,12 @@
 
 本文记录已完成的设计与实现、已验证到什么程度、存在哪些缺陷，以及达成目标还差什么。
 
-**当前状态**：推理骨架已打通；已修正 Qwen3.5 zero-centered RMSNorm 语义，
-当前共定义 47 个 GTest（阶段 1 新增 3 个 norm 测试，阶段 2 新增 5 个安全性
-测试）。CPU 专项与 tiny-model 端到端测试通过；本次环境无可用 CUDA 设备，
-新增 CUDA 对比测试会自动 skip。
-**但尚未用真实权重验证过** —— 见「第 5 节 关键缺口」。
+**当前状态**：Qwen3.5-0.8B 真实权重的 CPU 文本推理已与 Transformers
+FP32/eager 实现逐层对齐；24 层 hidden state、最终 norm、完整 logits 以及前 10 个
+greedy token 均通过比较。当前共定义 47 个 GTest。CPU 专项与 tiny-model 端到端
+测试通过；本次环境无可用 CUDA 设备，CUDA 对比测试会自动 skip。
+
+尚未完成的是 4B/9B 真实模型运行及其所需的低精度权重/算子支持，见「第 5 节」。
 
 ---
 
@@ -209,7 +210,7 @@ CHECK_EQ(pos * sizeof(float) + sizeof(Qwen35RawConfig), raw_model_data_->file_si
 
 磁盘格式（v2，magic `K35D`）：18 个 int32 + 2 个 float 的头，随后按 `create_param_layers` 的顺序排列 fp32 权重。原有 7-int `ModelConfig` 描述不了混合模型，故另立版本化格式而非扩展。
 
-### 3.5 修改的既有文件（8 个，共 +52/-14 行）
+### 3.5 初始接入时修改的既有文件（8 个，共 +52/-14 行）
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
@@ -220,7 +221,8 @@ CHECK_EQ(pos * sizeof(float) + sizeof(Qwen35RawConfig), raw_model_data_->file_si
 | `kuiper/include/op/layer.h` | `LayerType` 追加 11–20（**尾部追加，原值不变**） | 新增 |
 | `kuiper/include/op/encode.h`<br>`kuiper/source/op/encode.cpp`<br>`kuiper/source/model/model.cpp` | 宏条件加 `QWEN35_SUPPORT`，复用 `QwenEncodeLayer` | 新增 |
 
-**未改动任何现有算子的实现或语义。**
+初始接入未改动任何现有算子的实现或语义。阶段 3 另行修复了所有 GPT-2 byte-level
+BPE 共用的空格预处理错误，详见 4.7。
 
 ---
 
@@ -270,7 +272,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 
 ### 4.5 端到端（合成模型）
 
-`test/test_model/test_qwen35.cpp`，当前 10 个配置/模型测试，其中端到端核心测试如下：
+`test/test_model/test_qwen35.cpp`，当前 10 个配置/模型测试，其中核心测试如下：
 
 | 测试 | 覆盖 |
 |---|---|
@@ -282,6 +284,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 | `Qwen35Tiny.SamplingSkipsEmbeddingPadding` | 保留有效特殊 token，排除 `[248070, 248320)` padding 行 |
 | `Qwen35Config.ReportsItsOwnModelType` | 模型类型不再误报为 Llama2 |
 | `Qwen35Config.RejectsZeroIntervalInModelHeader` | 非法 header 在派生尺寸前返回解析错误，不触发除零 |
+| `Qwen35Tokenizer.MatchesTransformersChatPrompt` | 真实 tokenizer 对同一 chat prompt 的编码/解码与 Transformers 一致 |
 
 合成模型与 4B **同构**：真实 vocab 248320、head_dim 256、rotary_dim 64、interval 4、v:k=2:1、tie_word_embeddings —— 只缩小 hidden/inter/layers。生成器 [`test/test_model/make_tiny_qwen35.py`](test/test_model/make_tiny_qwen35.py) 已入库，可字节级复现。
 
@@ -291,11 +294,36 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 47 个 GTest。阶段 2 新增的 5 个专项测试全部通过；连同阶段 1 回归和
-tiny-model CPU 端到端验证，本次运行 12 个测试，11 个通过，1 个 CUDA norm
-对比因运行环境无可用设备而跳过。
+当前共定义 47 个 GTest。Qwen3.5 专项共 14 个；本次运行结果为 12 个通过，
+2 个 CUDA 对比因运行环境无可用设备而跳过。
 
-### 4.6 已发现并修复的实现错误
+### 4.6 真实 Qwen3.5-0.8B 对 Transformers（阶段 3）
+
+使用 `Qwen/Qwen3.5-0.8B` 的真实 safetensors 导出 3.01 GB FP32 checkpoint，
+在 CPU 上与 Transformers 5.6.2 的 FP32/eager 路径对齐。验证工具位于
+[`tools/verify_qwen35/`](tools/verify_qwen35/)，会保存两侧的 token、每层 hidden
+state、最终 norm、完整 logits 和前 10 个 greedy token。
+
+默认 prompt 经两侧 tokenizer 均编码为 12 个 token。数值结果：
+
+| 对比项 | 结果 |
+|---|---|
+| decoder 层 0–23 | 最大绝对误差 `1.54972e-05`，无层超过 `2e-3` 相对阈值 |
+| final norm | 最大绝对误差 `9.99570e-05`，相对误差 `2.54569e-06` |
+| 完整 logits（12×248320） | 最大绝对误差 `7.67708e-05`，平均绝对误差 `6.35322e-06` |
+| 前 10 个 greedy token | **完全一致** |
+
+前 10 个 token ID：
+
+```text
+[248068, 271, 248069, 271, 332, 9010, 16004, 20736, 318, 15015]
+```
+
+解码开头为 `<think>\n\n</think>\n\n**Artificial Intelligence (AI`。这证明 0.8B
+路径上的真实权重顺序、混合层调度、GDN 状态、full attention、RoPE、norm、MLP、
+KV cache 与自回归状态推进均已对齐，而不再只是合成权重自测。
+
+### 4.7 已发现并修复的实现错误
 
 **q_proj 的门拆分（严重）**。核对官方 `modeling_qwen3_5.py` 发现：
 
@@ -340,20 +368,26 @@ RMSNorm 会使用 `1e-5`，不是配置中的 `1e-6`。现已新增专用
 - CUDA argmax 的异步 D2H copy 现在会在读取栈上结果前同步 stream，并释放每次
   采样申请的 device index，避免结果竞争和逐 token allocator 泄漏。
 
+**BPE 空格预处理错误（阶段 3 已修复）**。tokenizer 构造阶段已经把 GPT-2
+unicode-byte 词表键还原为原始字节，encode 时却又把 ASCII 空格替换成 UTF-8
+字符 `Ġ`，导致默认 prompt 从官方的 12 个 token 膨胀为 16 个。现已改为把原始
+UTF-8 字节直接交给 tiktoken，decode 同样不再做反向替换，并增加真实 tokenizer
+回归测试。
+
 ---
 
 ## 5. 关键缺口
 
-### 5.1 未用真实权重验证（最大风险）
+### 5.1 4B/9B 真实权重尚未端到端验证
 
-**所有验证都基于合成权重（随机数）。与 HF 的 logits 对比这一关没过。**
+0.8B 的真实权重已完成逐层和生成对齐，覆盖了 1:1 的 GDN v:k head 布局和 tied
+embedding 输出头。4B/9B 仍有两个只能由对应 checkpoint 最终确认的分支：
 
-合成模型能证明的：形状、布局、调度、状态管理、CPU/CUDA 一致性。
-**不能证明的**：权重顺序是否真的对得上、RoPE 相位是否正确、GDN 各项语义是否匹配。
+- 4B/9B 的 GDN 为 v:k=2:1；目前该分组路径已有真实尺寸算子级参考测试和同构
+  tiny-model 测试，但尚未跑真实 4B 权重。
+- 9B 使用独立 `lm_head`；导出和加载分支已实现，但尚未跑真实 9B 权重。
 
-`gated_delta_step` 已单独对齐官方实现，但**组装后的整体**没有验证过。上面刚发现的 q_proj bug 就是这类问题的例子 —— 合成测试全绿，但真实推理会输出乱码。
-
-**这是达成目标的必经一步，也是最可能暴露新问题的一步。**
+两者当前首先受下面的 FP32 内存限制阻塞。
 
 ### 5.2 显存/内存不足
 
@@ -393,21 +427,25 @@ GDN 递推本身串行（官方的分块并行版 `torch_chunk_gated_delta_rule`
 
 按依赖顺序。
 
-### 步骤 1：解决内存（阻塞项，必须先做）
+### 步骤 1：0.8B 真实权重对齐（阶段 3，已完成）
+
+0.8B FP32 已完成逐层、logits 和 10-token greedy 对齐，结果见 4.6。
+
+### 步骤 2：解决 4B/9B 内存（下一阻塞项）
 
 fp32 的 4B 需要 17 GB，本机 GPU 12 GB、内存 15 GB，两条路都不通。三个选项：
 
 | 方案 | 工作量 | 说明 |
 |---|---|---|
 | **A. 加 bf16/fp16 权重支持** | 大 | 4B 降到 ~8.5 GB，可放进 12 GB GPU。需要改 Tensor 的 dtype 体系、全部 matmul kernel、导出器。**一劳永逸，推荐** |
-| **B. 先用 0.8B 验证正确性** | 小 | 0.8B fp32 ≈ 3.4 GB，GPU 完全放得下。**验证权重顺序/RoPE/GDN 语义与 4B 完全等价**（同构，只是维度小）。**推荐作为第一步** |
+| **B. 先用 0.8B 验证正确性（已完成）** | 小 | 0.8B fp32 ≈ 3.4 GB；阶段 3 已验证权重顺序、RoPE、GDN 和生成状态 |
 | C. CPU + mmap 惰性加载 | 中 | 靠 mmap 让 OS 按需换页，能跑但极慢；15 GB 内存下仍会 swap |
 
-**建议：先做 B**（用 0.8B 打通并对齐 HF），**再做 A**（拿到 4B/9B 的实际能力）。B 能以最小代价暴露 5.1 里的全部语义问题。
+方案 B 已在阶段 3 完成。下一阶段应实施方案 A，再运行 4B/9B 的真实权重验证。
 
 注：0.8B 是 `nk=16/nv=16`（1:1），4B/9B 是 2:1。两者都要测到才算覆盖分组路径 —— 分组逻辑已在算子级用 4B 尺寸验证过（4.2、4.3），但端到端只测了合成模型。
 
-### 步骤 2：与 HF 对齐 logits（正确性关口）
+### 步骤 3：复现 0.8B 与 HF 对齐（已完成）
 
 ```bash
 # 1. 下载真实模型
@@ -420,37 +458,31 @@ python3 tools/export_qwen35/export.py --model_dir ~/models/Qwen3.5-0.8B \
 python3 tools/export_qwen35/export.py --model_dir ~/models/Qwen3.5-0.8B \
         --output ~/models/qwen35_0.8b.bin --max_seq_len 4096
 
-# 3. 推理
+# 3. 生成两侧 trace 并比较
 source tools/env.sh
 export LD_LIBRARY_PATH=$PWD/lib:$LD_LIBRARY_PATH
-./build/demo/qwen35_infer ~/models/qwen35_0.8b.bin \
-        ~/models/Qwen3.5-0.8B/tokenizer.json 64
+./build/demo/qwen35_trace ~/models/qwen35_0.8b.bin \
+        ~/models/Qwen3.5-0.8B/tokenizer.json /tmp/qwen35-kuiper
+python3 tools/verify_qwen35/hf_reference.py \
+        --model_dir ~/models/Qwen3.5-0.8B --output_dir /tmp/qwen35-hf
+python3 tools/verify_qwen35/compare_traces.py \
+        --kuiper_dir /tmp/qwen35-kuiper --reference_dir /tmp/qwen35-hf
 ```
 
-对齐方法（**必须逐层做，不要只比最终输出**）：
+工具逐层比较并报告首个超阈值层，同时要求前 10 个 greedy token 完全一致。
 
-1. 用 HF 跑同一 prompt，`output_hidden_states=True` 存下每层输出
-2. 在 `Qwen35Model::forward` 里加临时 dump，导出每层 hidden state
-3. 逐层比对，定位**第一个**发散的层
-4. 若某 linear 层发散 → 查 GDN 各中间量（conv 输出、l2norm 后的 q/k、beta、g、state）
-5. 若某 full 层发散 → 查 q/gate 拆分、QK-norm、RoPE 相位、输出门
-
-判定标准：前 10 个 token 的 greedy 输出与 HF 完全一致。
-
-预期会踩的坑（基于 4.6 的经验）：权重顺序、RoPE 相位、门拆分这三类最容易出错，且**只有真实权重能暴露**。zero-centered RMSNorm 已有专项测试，但仍需在真实逐层对齐中确认。
-
-### 步骤 3：修掉 5.4 中危项（阶段 2 已完成）
+### 步骤 4：修掉 5.4 中危项（阶段 2 已完成）
 
 - `float delta[512]` 已换成按实际 `v_head_dim` 分配的一行复用缓冲
 - 采样范围已限制到 tokenizer 的 248070 个连续有效 ID
 - 已增加 `kModelTypeQwen35` 枚举
 - 额外完成非法模型头的前置校验和 CUDA argmax 同步/allocator 释放
 
-### 步骤 4：跑 4B/9B
+### 步骤 5：跑 4B/9B
 
-依赖步骤 1A（bf16）。9B 无 tie_word_embeddings、有独立 `lm_head`，导出器已处理该分支但未实测。
+依赖步骤 2A（bf16）。9B 无 tie_word_embeddings、有独立 `lm_head`，导出器已处理该分支但未实测。
 
-### 步骤 5（可选）：性能
+### 步骤 6（可选）：性能
 
 - GDN 分块并行（prompt 阶段）
 - `gated_delta_step_cu` 两趟融合
@@ -473,9 +505,13 @@ kuiper/source/op/kernels/cpu/qwen35_kernel.cpp  CPU kernel 实现
 kuiper/source/op/kernels/cuda/qwen35_kernel.cuh CUDA kernel 声明
 kuiper/source/op/kernels/cuda/qwen35_kernel.cu  CUDA kernel 实现
 demo/main_qwen35.cpp                            推理 demo
-test/test_model/test_qwen35.cpp                 5 个单元测试
+test/test_model/test_qwen35.cpp                 10 个配置/模型测试
 test/test_model/make_tiny_qwen35.py             合成模型生成器
 tools/export_qwen35/export.py                   导出器
+tools/verify_qwen35/kuiper_trace.cpp            Kuiper 逐层 trace 与 10-token 生成
+tools/verify_qwen35/hf_reference.py             Transformers FP32/eager 参考 trace
+tools/verify_qwen35/compare_traces.py           逐层误差与 token 比较器
+tools/verify_qwen35/README.md                    对齐工具使用说明
 tools/env.sh                                    工具链环境
 ```
 

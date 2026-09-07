@@ -1,7 +1,9 @@
 #ifndef KUIPER_INCLUDE_MODEL_QWEN35_H_
 #define KUIPER_INCLUDE_MODEL_QWEN35_H_
 #include <base/cuda_config.h>
+#include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 #include "model.h"
 #include "op/add.h"
@@ -102,6 +104,9 @@ enum class Qwen35Buffer {
 
 class Qwen35Model : public Model {
  public:
+  using HiddenStateCallback =
+      std::function<void(int32_t position, int32_t layer_idx, const tensor::Tensor& hidden)>;
+
   explicit Qwen35Model(base::TokenizerType tokenizer_type, std::string token_path,
                        std::string model_path, bool is_quant_model);
 
@@ -121,6 +126,13 @@ class Qwen35Model : public Model {
   // sequence: unlike a KV cache, which is overwritten position by position, the
   // GDN state accumulates and would otherwise leak across sequences.
   void reset_state() const;
+
+  // Optional observability hook for reference alignment. layer_idx is [0, N)
+  // after each decoder block and N after the final norm. It is unset in normal
+  // inference, so tensors are neither copied nor synchronized by the model.
+  void set_hidden_state_callback(HiddenStateCallback callback) {
+    hidden_state_callback_ = std::move(callback);
+  }
 
  protected:
   // Kept protected, matching Model, so focused model tests can exercise the
@@ -167,6 +179,7 @@ class Qwen35Model : public Model {
   std::shared_ptr<kernel::CudaConfig> cuda_config_;
   std::unique_ptr<Qwen35Layers> layers_;
   mutable std::map<Qwen35Buffer, tensor::Tensor> q35_buffers_;
+  HiddenStateCallback hidden_state_callback_;
 };
 
 }  // namespace model

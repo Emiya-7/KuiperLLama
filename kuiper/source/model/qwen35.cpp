@@ -808,8 +808,14 @@ base::Status Qwen35Model::forward(const tensor::Tensor& input, const tensor::Ten
       attention_linear(i);
     }
     feed_forward(i, input);
+    if (hidden_state_callback_) {
+      hidden_state_callback_(pos_tensor.index<int32_t>(0), i, input);
+    }
   }
   cls_logits(input);
+  if (hidden_state_callback_) {
+    hidden_state_callback_(pos_tensor.index<int32_t>(0), q35_.layer_num, input);
+  }
   return base::error::Success();
 }
 
