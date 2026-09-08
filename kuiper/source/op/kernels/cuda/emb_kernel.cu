@@ -1,5 +1,6 @@
 #include "emb_kernel.cuh"
 #include <cuda_bf16.h>
+#include "cuda_launch_check.cuh"
 namespace kernel {
 __global__ void emb_kernel_cu_fp32(int32_t vocab_size, int32_t token_num, int32_t weight_dim,
                                    const int32_t* input_ptr, const float* weight_ptr,
@@ -61,10 +62,12 @@ void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
     emb_kernel_cu_bf16<<<max_seq_len, thread_num, 0, cuda_stream>>>(
         vocab_size, input_num, weight_dim, in_ptr,
         reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>()), out_ptr);
+    check_cuda_kernel_launch("emb_kernel_cu_bf16");
   } else {
     CHECK(weight.data_type() == base::DataType::kDataTypeFp32);
     emb_kernel_cu_fp32<<<max_seq_len, thread_num, 0, cuda_stream>>>(
         vocab_size, input_num, weight_dim, in_ptr, weight.ptr<float>(), out_ptr);
+    check_cuda_kernel_launch("emb_kernel_cu_fp32");
   }
 }
 }  // namespace kernel

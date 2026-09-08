@@ -1,5 +1,6 @@
 #include "qwen35_kernel.cuh"
 #include <cub/block/block_reduce.cuh>
+#include "cuda_launch_check.cuh"
 
 namespace kernel {
 
@@ -35,6 +36,7 @@ __global__ void l2norm_kernel(const float* in, float* out, int dim, float eps) {
 void l2norm_cu(const float* in, float* out, int32_t n, int32_t dim, float eps,
                cudaStream_t stream) {
   l2norm_kernel<kThreads><<<n, kThreads, 0, stream>>>(in, out, dim, eps);
+  check_cuda_kernel_launch("l2norm_kernel");
 }
 
 // ------------------------------------------------------ split head interleaved
@@ -54,6 +56,7 @@ void split_head_interleaved_cu(const float* in, float* first, float* second, int
   const int total = num_heads * width;
   split_head_interleaved_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       in, first, second, num_heads, width);
+  check_cuda_kernel_launch("split_head_interleaved_kernel");
 }
 
 // --------------------------------------------------------------- elementwise
@@ -72,12 +75,15 @@ __global__ void mul_kernel(const float* a, const float* b, float* out, int n) {
 
 void silu_cu(const float* in, float* out, int32_t n, cudaStream_t stream) {
   silu_kernel<<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(in, out, n);
+  check_cuda_kernel_launch("silu_kernel");
 }
 void sigmoid_cu(const float* in, float* out, int32_t n, cudaStream_t stream) {
   sigmoid_kernel<<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(in, out, n);
+  check_cuda_kernel_launch("sigmoid_kernel");
 }
 void mul_cu(const float* a, const float* b, float* out, int32_t n, cudaStream_t stream) {
   mul_kernel<<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(a, b, out, n);
+  check_cuda_kernel_launch("mul_kernel");
 }
 
 // ------------------------------------------------------------ softplus decay
@@ -96,6 +102,7 @@ void softplus_decay_cu(const float* a, const float* A_log, const float* dt_bias,
                        int32_t n, cudaStream_t stream) {
   softplus_decay_kernel<<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(a, A_log, dt_bias,
                                                                                 g, n);
+  check_cuda_kernel_launch("softplus_decay_kernel");
 }
 
 // ----------------------------------------------------------- gated rmsnorm
@@ -127,6 +134,7 @@ __global__ void gated_rmsnorm_kernel(const float* in, const float* gate, const f
 void gated_rmsnorm_cu(const float* in, const float* gate, const float* weight, float* out,
                       int32_t n, int32_t dim, float eps, cudaStream_t stream) {
   gated_rmsnorm_kernel<kThreads><<<n, kThreads, 0, stream>>>(in, gate, weight, out, dim, eps);
+  check_cuda_kernel_launch("gated_rmsnorm_kernel");
 }
 
 // ----------------------------------------------- zero-centered rmsnorm
@@ -158,6 +166,7 @@ __global__ void zero_centered_rmsnorm_kernel(const float* in, const float* weigh
 void zero_centered_rmsnorm_cu(const float* in, const float* weight, float* out, int32_t n,
                               int32_t dim, float eps, cudaStream_t stream) {
   zero_centered_rmsnorm_kernel<kThreads><<<n, kThreads, 0, stream>>>(in, weight, out, dim, eps);
+  check_cuda_kernel_launch("zero_centered_rmsnorm_kernel");
 }
 
 // ------------------------------------------------------- causal conv1d decode
@@ -189,6 +198,7 @@ void causal_conv1d_decode_cu(const float* in, float* state, const float* weight,
                              int32_t dim, int32_t k, cudaStream_t stream) {
   causal_conv1d_decode_kernel<<<(dim + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       in, state, weight, out, dim, k);
+  check_cuda_kernel_launch("causal_conv1d_decode_kernel");
 }
 
 // ---------------------------------------------------------- gated delta step
@@ -251,6 +261,7 @@ void gated_delta_step_cu(const float* q, const float* k, const float* v, const f
   const size_t shmem = static_cast<size_t>(k_head_dim) * sizeof(float);
   gated_delta_step_kernel<kThreads><<<num_v_heads, kThreads, shmem, stream>>>(
       q, k, v, g, beta, state, out, num_k_heads, num_v_heads, k_head_dim, v_head_dim, q_scale);
+  check_cuda_kernel_launch("gated_delta_step_kernel");
 }
 
 // -------------------------------------------------------------- partial rope
@@ -288,6 +299,7 @@ void rope_partial_cu(const float* sin_cache, const float* cos_cache, float* q, f
   const int total = (num_q_heads + num_k_heads) * (rotary_dim / 2);
   rope_partial_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       sin_cache, cos_cache, q, k, pos, num_q_heads, num_k_heads, head_dim, rotary_dim);
+  check_cuda_kernel_launch("rope_partial_kernel");
 }
 
 __global__ void rope_partial_cache_kernel(float* sin_cache, float* cos_cache, int max_seq_len,
@@ -309,6 +321,7 @@ void rope_partial_cache_cu(float* sin_cache, float* cos_cache, int32_t max_seq_l
   const int total = max_seq_len * (rotary_dim / 2);
   rope_partial_cache_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       sin_cache, cos_cache, max_seq_len, rotary_dim, theta);
+  check_cuda_kernel_launch("rope_partial_cache_kernel");
 }
 
 }  // namespace kernel

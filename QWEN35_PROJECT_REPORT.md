@@ -30,7 +30,7 @@
   分层卸载或更大设备；
 - 真实 4B CUDA 的 33 个 hidden 观测点、完整 logits 和 10-token generation 已分别
   与 Kuiper CPU、Transformers BF16 trace 对齐；
-- 全量 52 项测试已在 RTX 4070 SUPER 上全部通过。
+- 全量 53 项测试已在 RTX 4070 SUPER 上全部通过。
 
 更细的架构推导、张量形状和公式见 [`QWEN35_STATUS.md`](QWEN35_STATUS.md)。本文重点
 记录从初始状态到现在完成了什么、实际验证到哪里、剩余问题和可直接执行的命令。
@@ -60,8 +60,8 @@ Qwen3.5 当成接近 Qwen3 的普通 attention 模型，这个前提不成立。
 
 以 `upstream/main` 为基准，当前阶段 4 分支在生成本文档前的差异为：
 
-- 修改/新增 43 个文件；
-- 新增约 5,221 行，删除约 62 行；
+- 修改/新增约 44 个文件；
+- 新增约 5,400 行，删除约 70 行；
 - 主要新增内容集中在 Qwen3.5 模型、CPU/CUDA kernel、导出器、真实模型对齐工具和测试；
 - 原有 Llama/Qwen2/Qwen3 的枚举值和算子语义尽量保持不变。
 
@@ -257,6 +257,18 @@ CUDA 编译命令含：
 - `qwen35_trace` 增加 `--device cpu|cuda`，CUDA 模式在模型 stream 上逐层 D2H 并同步。
 - 完成真实 4B CUDA hidden/logits 与 Kuiper CPU、Transformers BF16 的逐层比较。
 
+### 4.6 CUDA launch 安全性和大尺寸 BF16 matmul 回归
+
+完成内容：
+
+- 新增内部 `check_cuda_kernel_launch()`，在 launch 点立即调用 `cudaGetLastError()`，
+  报错信息包含具体 kernel 名称，避免错误延迟到后续同步时被归因到错误位置。
+- Qwen3.5 专用的 12 个 CUDA launch 已全部接入检查。
+- 通用 matmul 的 FP32/BF16/INT8 和 embedding 的 FP32/BF16 launch 也统一接入检查，
+  避免同一入口因权重 dtype 不同而产生检查行为差异。
+- 新增真实 Qwen3.5-4B `in_proj_z [4096, 2560]` 尺寸的 BF16 CUDA matmul 测试，
+  覆盖 10,485,760 个 BF16 权重，与 CPU FP32 累加结果按 `2e-5` 相对阈值比较。
+
 ---
 
 ## 5. 算子层当前状态
@@ -285,6 +297,8 @@ CUDA 编译命令含：
 - tiny 模型同时覆盖 linear/full 两类层、v:k=2:1、partial RoPE、tied embedding 和 BF16。
 - RTX 4070 SUPER 上 tiny CPU/CUDA 完整 logits 对齐测试通过。
 - 真实 4B CUDA 生成成功，说明全部实际尺寸 kernel、设备权重和状态缓冲能协同运行。
+- `[4096, 2560]` BF16 matmul CUDA 专项测试通过，覆盖 4B `in_proj_z` 的实际尺寸。
+- Qwen3.5、matmul 和 embedding 的相关 launch 均会立即检查并报告 launch error。
 
 ### 5.3 算子层仍然不足的部分
 
@@ -309,8 +323,9 @@ CPU BF16 matmul 同样是显式三重循环，没有走 Armadillo/BLAS 的矩阵
 
 #### kernel 安全性和调试
 
-- 多数新 kernel launch 后没有统一执行 `cudaGetLastError()`。
-- 缺少面向真实大尺寸的独立 BF16 matmul CUDA 数值/性能测试；目前由 tiny 端到端覆盖。
+- Qwen3.5 新 kernel、matmul 和 embedding 已统一执行 launch error 检查；项目中更早的
+  add/MHA/RMSNorm/RoPE/SwiGLU 等旧 kernel 尚未全部迁移到同一 helper。
+- 大尺寸 BF16 matmul 已有数值回归，但还没有独立性能基准或吞吐回归阈值。
 - Compute Sanitizer 在当前 WSL/WDDM 环境不能初始化设备调试接口。
 
 #### 未实现算子/精度路径
@@ -392,7 +407,7 @@ Transformers BF16 会在层间舍入激活，Kuiper 只以 BF16 保存大矩阵�
 - 最小 CUDA kernel 测试通过；
 - `Qwen35Tiny.CudaMatchesCpu` 独立通过；
 - 真实 8.413 GB Qwen3.5-4B checkpoint CUDA 加载和生成成功。
-- 完整 52 项测试全部通过。
+- 完整 53 项测试全部通过。
 
 4B CUDA 实测：
 
@@ -437,9 +452,10 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 
 ### 6.6 测试状态
 
-测试二进制当前包含 52 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
-`52/52 passed`，包括 `Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu` 和
-`Qwen35Tiny.CudaMatchesCpu`。
+测试二进制当前包含 53 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
+`53/53 passed`，包括 `Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu`、
+`Qwen35Tiny.CudaMatchesCpu` 和真实 4B 投影尺寸的
+`test_matmul_bf16.qwen35_4b_projection_cuda_matches_cpu`。
 
 此前 RMSNorm CUDA 测试会在完成数值断言后发生 SIGSEGV。cuda-gdb 定位到测试手动
 调用 `cudaStreamDestroy` 后，`CudaConfig::~CudaConfig()` 又销毁同一 stream。测试中的
@@ -491,7 +507,7 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 2. CPU BF16 matmul没有 BLAS 优化。
 3. GDN prompt 逐 token 串行，长 prompt 性能差。
 4. GDN state 两趟扫描可融合。
-5. kernel launch 错误检查不统一。
+5. 旧 CUDA kernel 尚未全部迁移到统一 launch error helper。
 6. conv state 可改环形缓冲。
 7. `view()` 是不拥有内存的 Tensor，生命周期依赖模型 buffer 长期存在。
 8. demo prompt 硬编码为 `What is AI?`，命令行不能直接输入任意 prompt。
@@ -620,7 +636,7 @@ KV cache 和 score buffer；在 12 GB 显存上应逐级测试 512、2048、4096
   --weight_dtype bf16
 ```
 
-运行全部 52 项：
+运行全部 53 项：
 
 ```bash
 GLOG_logtostderr=1 \
@@ -634,13 +650,12 @@ KUIPER_TINY_QWEN35_TOKENIZER=/home/tuesday/workspace/icd/models/Qwen__Qwen3.5-0.
 
 ## 10. 建议的后续开发顺序
 
-1. 为新 CUDA kernel 统一增加 launch error 检查，并增加 BF16 大尺寸 matmul 专项测试。
-2. 将 `test_llm` 和 tiny fixture 接入 CTest/CI。
-3. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
+1. 将 `test_llm` 和 tiny fixture 接入 CTest/CI。
+2. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
    tiled kernel。
-4. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
-5. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
-6. 下载并验证 9B 独立 `lm_head` 路径。
+3. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
+4. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
+5. 下载并验证 9B 独立 `lm_head` 路径。
 
 建议继续遵守“一项完整功能一个 commit”的规则：实现、测试、文档属于同一功能时放入
 同一个 commit；互不依赖的修复和优化分别提交。

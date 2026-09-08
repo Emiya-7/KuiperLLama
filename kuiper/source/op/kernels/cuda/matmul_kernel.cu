@@ -2,6 +2,7 @@
 #include <cub/block/block_reduce.cuh>
 #include <cuda_bf16.h>
 #include "../kernels_interface.h"
+#include "cuda_launch_check.cuh"
 #include "matmul_kernel.cuh"
 namespace kernel {
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
@@ -134,10 +135,12 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
     matmul_kernel_cu_fp32bf16<128, 1><<<K, 128, 0, stream>>>(
         input.ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>()),
         const_cast<float*>(output.ptr<float>()), M, K);
+    check_cuda_kernel_launch("matmul_kernel_cu_fp32bf16");
   } else {
     CHECK(weight.data_type() == base::DataType::kDataTypeFp32);
     matmul_kernel_cu_fp32<128, 1><<<K, 128, 0, stream>>>(
         input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K);
+    check_cuda_kernel_launch("matmul_kernel_cu_fp32");
   }
 }
 
@@ -159,10 +162,12 @@ void matmul_kernel_cu_qint8(const tensor::Tensor& input, const tensor::Tensor& w
     matmul_kernel_cu_fp32int8<128, 1><<<K, 128, 0, config->stream>>>(
         input.ptr<float>(), weight.ptr<int8_t>(), scale.ptr<float>(), group_size,
         const_cast<float*>(output.ptr<float>()), M, K);
+    check_cuda_kernel_launch("matmul_kernel_cu_fp32int8");
   } else {
     matmul_kernel_cu_fp32int8<128, 1><<<K, 128>>>(input.ptr<float>(), weight.ptr<int8_t>(),
                                                   scale.ptr<float>(), group_size,
                                                   const_cast<float*>(output.ptr<float>()), M, K);
+    check_cuda_kernel_launch("matmul_kernel_cu_fp32int8");
   }
 }
 }  // namespace kernel

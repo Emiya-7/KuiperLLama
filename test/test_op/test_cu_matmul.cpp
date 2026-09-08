@@ -2,6 +2,9 @@
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include "../source/op/kernels/cpu/matmul_kernel.h"
 #include "../source/op/kernels/kernels_interface.h"
 #include "../utils.cuh"
@@ -30,6 +33,64 @@ TEST(test_matmul_bf16, fp32_input_bf16_weight_cpu) {
   EXPECT_FLOAT_EQ(output.index<float>(1), -10.f);
   EXPECT_FLOAT_EQ(output.index<float>(2), -3.25f);
 }
+
+TEST(test_matmul_bf16, qwen35_4b_projection_cuda_matches_cpu) {
+  int device_count = 0;
+  const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+  if (device_status != cudaSuccess || device_count == 0) {
+    cudaGetLastError();
+    GTEST_SKIP() << "CUDA device unavailable";
+  }
+
+  // Qwen3.5-4B in_proj_z is [4096, 2560]. This exercises more than ten
+  // million BF16 weights instead of only validating a toy matrix.
+  constexpr int32_t kInputSize = 2560;
+  constexpr int32_t kOutputSize = 4096;
+  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+  auto alloc_cuda = base::CUDADeviceAllocatorFactory::get_instance();
+  tensor::Tensor input_cpu(base::DataType::kDataTypeFp32, kInputSize, true, alloc_cpu);
+  tensor::Tensor weight_cpu(base::DataType::kDataTypeBf16, kOutputSize, kInputSize, true,
+                            alloc_cpu);
+  tensor::Tensor output_cpu(base::DataType::kDataTypeFp32, kOutputSize, true, alloc_cpu);
+
+  for (int32_t column = 0; column < kInputSize; ++column) {
+    input_cpu.index<float>(column) = static_cast<float>(column % 29 - 14) / 32.f;
+  }
+  for (int32_t row = 0; row < kOutputSize; ++row) {
+    for (int32_t column = 0; column < kInputSize; ++column) {
+      const int32_t pattern = (row * 17 + column * 13) % 31 - 15;
+      weight_cpu.index<uint16_t>(static_cast<int64_t>(row) * kInputSize + column) =
+          base::float_to_bfloat16(static_cast<float>(pattern) / 64.f);
+    }
+  }
+  matmul_kernel_cpu(input_cpu, weight_cpu, output_cpu);
+
+  tensor::Tensor input_cuda = input_cpu.clone();
+  tensor::Tensor weight_cuda = weight_cpu.clone();
+  input_cuda.to_cuda();
+  weight_cuda.to_cuda();
+  tensor::Tensor output_cuda(base::DataType::kDataTypeFp32, kOutputSize, true, alloc_cuda);
+
+  CudaConfig config;
+  ASSERT_EQ(cudaStreamCreate(&config.stream), cudaSuccess);
+  get_matmul_kernel(base::DeviceType::kDeviceCUDA)(input_cuda, weight_cuda, output_cuda, 1.f,
+                                                    &config);
+  ASSERT_EQ(cudaStreamSynchronize(config.stream), cudaSuccess);
+  output_cuda.to_cpu();
+
+  double max_abs = 0.0;
+  double reference_scale = 0.0;
+  for (int32_t row = 0; row < kOutputSize; ++row) {
+    const double expected = output_cpu.index<float>(row);
+    const double actual = output_cuda.index<float>(row);
+    ASSERT_TRUE(std::isfinite(actual)) << "row=" << row;
+    max_abs = std::max(max_abs, std::abs(actual - expected));
+    reference_scale = std::max(reference_scale, std::abs(expected));
+  }
+  EXPECT_LT(max_abs / std::max(reference_scale, 1e-6), 2e-5)
+      << "max|cpu-cuda|=" << max_abs << ", |reference|max=" << reference_scale;
+}
+
 TEST(test_matmul_cu, matmul_linear_stream5) {
   auto alloc_cu = base::CUDADeviceAllocatorFactory::get_instance();
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();

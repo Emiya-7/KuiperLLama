@@ -10,7 +10,7 @@
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
 8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 52 个 GTest；RTX 4070
 SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测试结果为
-52/52 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
+53/53 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
 分别与 Kuiper CPU、Transformers BF16 对齐。详细结果见
 [`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 
@@ -401,6 +401,12 @@ token。CUDA vs Kuiper CPU 的 decoder 最大相对误差为 `2.07594e-05`、log
 `1.32916e-02`，两组比较的 10 个 token 均完全一致。CUDA trace 含加载总耗时
 7.29 秒，峰值主机 RSS `8,429,096 KB`。
 
+新增 CUDA launch 检查后，Qwen3.5 专用 kernel 以及 matmul/embedding 的各 dtype
+分支都会在 launch 点立即检查 `cudaGetLastError()` 并报告 kernel 名称。另增加
+Qwen3.5-4B `in_proj_z [4096, 2560]` 真实尺寸的 BF16 CUDA matmul 专项测试，覆盖
+10,485,760 个权重，与 CPU 参考按 `2e-5` 相对阈值比较。RTX 4070 SUPER 上专项测试、
+全量 53 项测试和真实 4B CUDA trace 均通过。
+
 ### 4.9 已发现并修复的实现错误
 
 **q_proj 的门拆分（严重）**。核对官方 `modeling_qwen3_5.py` 发现：
@@ -494,7 +500,7 @@ GDN 递推本身串行（官方的分块并行版 `torch_chunk_gated_delta_rule`
 |---|---|---|
 | conv state 每步 O(k) 左移，未用环形缓冲 | `causal_conv1d_decode` | 低（k=4） |
 | `gated_delta_step_cu` 两趟扫描 state，可融合减少一半访存 | `cuda/qwen35_kernel.cu` | 低（性能） |
-| kernel launch 后普遍缺 `cudaGetLastError()` 检查 | 各处 | 低 |
+| 旧 CUDA kernel 尚未全部使用统一 launch helper | add/MHA/RMSNorm/RoPE/SwiGLU | 低 |
 | `view()` 返回非拥有张量，无生命周期保护 | `qwen35.cpp` | 低（buffer 在 init 一次性分配） |
 | 导出器 F16 分支逐元素 `struct.unpack`，很慢 | `export.py` | 低（真实 checkpoint 是 BF16，不走该分支） |
 | 无 int8 量化（`create_param_quant_layers` 直接 FATAL） | — | 中（9B 本机运行仍需要） |
@@ -596,6 +602,7 @@ tools/export_qwen35/export.py                   导出器
 tools/verify_qwen35/kuiper_trace.cpp            Kuiper 逐层 trace 与 10-token 生成
 tools/verify_qwen35/hf_reference.py             Transformers FP32/eager 参考 trace
 tools/verify_qwen35/compare_traces.py           逐层误差与 token 比较器
+kuiper/source/op/kernels/cuda/cuda_launch_check.cuh  CUDA launch 错误检查 helper
 tools/verify_qwen35/README.md                    对齐工具使用说明
 tools/env.sh                                    工具链环境
 ```
