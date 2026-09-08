@@ -63,3 +63,8 @@ The comparison fails if tokenization differs, any of the first 10 generated
 tokens differs, or any hidden-state layer exceeds the configured relative tolerance.
 Raw trace files are little-endian `int32`/`float32`; `metadata.json` records the
 shapes required to read them.
+
+The reference tool loads only the checkpoint's text tower, leaving the vision
+and MTP weights on disk. It uses FP32 by default for strict numerical alignment.
+For models that do not fit in host memory after FP32 widening, pass
+`--dtype bf16`; trace files are still widened to FP32 before they are written.
