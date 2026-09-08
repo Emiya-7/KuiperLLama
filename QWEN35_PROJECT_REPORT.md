@@ -20,6 +20,8 @@
   Transformers BF16 参考比较、RTX 4070 SUPER CUDA 真机推理和 CUDA 逐层 trace。
 - 当前 4B CUDA 推理不会因 12 GB 显存不足而失败；实测 21 个位置的 forward/generation
   阶段为 0.513 秒，约 40.95 steps/s。
+- `test_llm` 和自动生成的 tiny fixture 已接入 CTest，并由 GitHub Actions GPU workflow
+  复用同一测试入口。
 
 因此，**Qwen3.5-4B 的 BF16 weight-only 纯文本推理主链路已经跑通**。
 
@@ -28,8 +30,6 @@
 - Qwen3.5-9B 的独立 `lm_head` 虽然已经实现导出/加载分支，但没有真实权重验证；
 - 9B BF16 文本权重约 18 GB，超过本机 12 GB 显存和 15 GB 物理内存，需要 INT8、
   分层卸载或更大设备；
-- 真实 4B CUDA 的 33 个 hidden 观测点、完整 logits 和 10-token generation 已分别
-  与 Kuiper CPU、Transformers BF16 trace 对齐；
 - 全量 53 项测试已在 RTX 4070 SUPER 上全部通过。
 
 更细的架构推导、张量形状和公式见 [`QWEN35_STATUS.md`](QWEN35_STATUS.md)。本文重点
@@ -60,8 +60,8 @@ Qwen3.5 当成接近 Qwen3 的普通 attention 模型，这个前提不成立。
 
 以 `upstream/main` 为基准，当前阶段 4 分支在生成本文档前的差异为：
 
-- 修改/新增约 44 个文件；
-- 新增约 5,400 行，删除约 70 行；
+- 修改/新增约 46 个文件；
+- 新增约 5,550 行，删除约 120 行；
 - 主要新增内容集中在 Qwen3.5 模型、CPU/CUDA kernel、导出器、真实模型对齐工具和测试；
 - 原有 Llama/Qwen2/Qwen3 的枚举值和算子语义尽量保持不变。
 
@@ -461,8 +461,22 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 调用 `cudaStreamDestroy` 后，`CudaConfig::~CudaConfig()` 又销毁同一 stream。测试中的
 手动销毁已经删除，现在由 `CudaConfig` 保持唯一所有权并负责析构清理。
 
-此外，项目当前没有向 CTest 注册测试，所以 `ctest --test-dir build` 会显示
-`No tests were found`；必须直接执行 `build/test/test_llm`。这是测试基础设施缺口。
+CTest 现在注册两个项目测试：`qwen35_tiny_fixture` 和 `test_llm`。前者无需下载外部
+模型，会生成 108 个张量的 tiny safetensors、保持真实 248070 有效 ID 边界的确定性
+tokenizer，并导出约 66 MB 的 BF16 checkpoint；后者通过 `FIXTURES_REQUIRED` 自动获得
+模型和 tokenizer 路径。即使执行 `ctest -R '^test_llm$'`，CTest 也会自动补跑 setup。
+
+本机验证结果为 CTest `2/2 passed`，其中 `test_llm` 内部为 `53/53 passed`，fixture
+相关 tokenizer/CPU/CUDA 测试均实际执行，没有因环境变量缺失而 skip。
+
+`.github/workflows/qwen35-ci.yml` 在 `main`、`feat/**` push 和手动触发时，使用标签为
+`self-hosted, linux, x64, gpu` 的 CUDA runner 执行 configure、build 和同一条 CTest
+命令。这样不会在无 NVIDIA 设备的 runner 上误跑 CUDA 用例，也避免受信任范围外的
+pull request 代码直接落到自托管机器执行。
+
+截至 2026-09-08，GitHub API 返回该仓库已注册 runner 数量为 0，因此 workflow 配置已
+入库但远端 GPU job 暂时无法被调度。本次改动没有擅自在本机安装常驻 Actions Runner；
+后续需要在仓库 Settings 中注册本机或另一台 CUDA 机器，并附加 `gpu` 标签。
 
 ---
 
@@ -496,10 +510,6 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 1. **INT8 未实现**
    - 9B BF16 约 18 GB，无法在 12 GB 4070 SUPER 上常驻。
    - 建议优先做 weight-only INT8：embedding、matmul、checkpoint v4/量化元数据。
-
-2. **测试未接入 CTest**
-   - CI 或开发者执行 `ctest` 会误以为没有测试。
-   - 应在 `test/CMakeLists.txt` 中启用并注册 `test_llm`，同时提供 tiny fixture。
 
 ### P2：性能和工程质量
 
@@ -621,41 +631,38 @@ GLOG_logtostderr=1 ./build/demo/qwen35_infer \
 KV cache 和 score buffer；在 12 GB 显存上应逐级测试 512、2048、4096、8192，而不是
 直接使用原配置的 262144。
 
-### 9.5 当前可通过的 GPU 回归命令
+### 9.5 CTest 自动 fixture 与 GPU 回归命令
 
-重新生成 tiny fixture：
-
-```bash
-/home/tuesday/miniconda3/bin/python test/test_model/make_tiny_qwen35.py \
-  --out_dir /tmp/qwen35-stage4-tiny
-
-/home/tuesday/miniconda3/bin/python tools/export_qwen35/export.py \
-  --model_dir /tmp/qwen35-stage4-tiny \
-  --output /tmp/kuiper-qwen35-stage4-tiny-bf16.bin \
-  --max_seq_len 128 \
-  --weight_dtype bf16
-```
-
-运行全部 53 项：
+配置时启用测试并指定带 NumPy 的 Python：
 
 ```bash
-GLOG_logtostderr=1 \
-KUIPER_TINY_QWEN35=/tmp/kuiper-qwen35-stage4-tiny-bf16.bin \
-KUIPER_TINY_QWEN35_TOKENIZER=/home/tuesday/workspace/icd/models/Qwen__Qwen3.5-0.8B/tokenizer.json \
-./build/test/test_llm \
-  --gtest_color=yes
+source tools/env.sh
+cmake -S . -B build \
+  -DUSE_CPM=ON \
+  -DQWEN35_SUPPORT=ON \
+  -DBUILD_TESTING=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+  -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DCUDAToolkit_ROOT="$CUDA_HOME" \
+  -DPython3_EXECUTABLE=/home/tuesday/miniconda3/bin/python
+
+cmake --build build --target test_llm -j2
+ctest --test-dir build --output-on-failure --timeout 300
 ```
+
+不需要手工设置 `KUIPER_TINY_QWEN35` 或复制真实 tokenizer；CTest setup 会在
+`build/test/fixtures/qwen35/` 自动生成全部产物。
 
 ---
 
 ## 10. 建议的后续开发顺序
 
-1. 将 `test_llm` 和 tiny fixture 接入 CTest/CI。
-2. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
+1. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
    tiled kernel。
-3. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
-4. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
-5. 下载并验证 9B 独立 `lm_head` 路径。
+2. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
+3. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
+4. 下载并验证 9B 独立 `lm_head` 路径。
 
 建议继续遵守“一项完整功能一个 commit”的规则：实现、测试、文档属于同一功能时放入
 同一个 commit；互不依赖的修复和优化分别提交。

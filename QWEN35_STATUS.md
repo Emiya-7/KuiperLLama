@@ -8,7 +8,7 @@
 上与 Transformers FP32/eager 逐层对齐；Qwen3.5-4B 的真实 BF16 权重也已完成
 导出、Kuiper 端到端推理和 Transformers BF16 参考比较，覆盖了 4B 特有的 GDN
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
-8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 52 个 GTest；RTX 4070
+8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 53 个 GTest；RTX 4070
 SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测试结果为
 53/53 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
 分别与 Kuiper CPU、Transformers BF16 对齐。详细结果见
@@ -294,7 +294,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 | `Qwen35Config.ReportsItsOwnModelType` | 模型类型不再误报为 Llama2 |
 | `Qwen35Config.RejectsZeroIntervalInModelHeader` | 非法 header 在派生尺寸前返回解析错误，不触发除零 |
 | `Qwen35Config.RejectsUnknownMatrixWeightType` | v3 header 中未知矩阵 dtype 返回解析错误 |
-| `Qwen35Tokenizer.MatchesTransformersChatPrompt` | 真实 tokenizer 对同一 chat prompt 的编码/解码与 Transformers 一致 |
+| `Qwen35Tokenizer.MatchesTransformersChatPrompt` | fixture 保留真实 token ID，同一 chat prompt 的编码/解码与 Transformers 一致 |
 
 合成模型与 4B **同构**：真实 vocab 248320、head_dim 256、rotary_dim 64、interval 4、v:k=2:1、tie_word_embeddings —— 只缩小 hidden/inter/layers。生成器 [`test/test_model/make_tiny_qwen35.py`](test/test_model/make_tiny_qwen35.py) 已入库，可字节级复现。
 
@@ -304,7 +304,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 52 个 GTest，已在 RTX 4070 SUPER 上全部通过，包括 Qwen3.5 tiny 的
+当前共定义 53 个 GTest，已在 RTX 4070 SUPER 上全部通过，包括 Qwen3.5 tiny 的
 CPU/CUDA 端到端对齐、Tensor BF16 存储/转换、BF16 matmul 和 BF16 embedding。
 
 ### 4.6 真实 Qwen3.5-0.8B 对 Transformers（阶段 3）
@@ -598,6 +598,8 @@ kuiper/source/op/kernels/cuda/qwen35_kernel.cu  CUDA kernel 实现
 demo/main_qwen35.cpp                            推理 demo
 test/test_model/test_qwen35.cpp                 11 个配置/模型测试
 test/test_model/make_tiny_qwen35.py             合成模型生成器
+test/prepare_qwen35_fixture.cmake                CTest fixture 生成与导出驱动
+.github/workflows/qwen35-ci.yml                  自托管 GPU CI workflow
 tools/export_qwen35/export.py                   导出器
 tools/verify_qwen35/kuiper_trace.cpp            Kuiper 逐层 trace 与 10-token 生成
 tools/verify_qwen35/hf_reference.py             Transformers FP32/eager 参考 trace
@@ -619,19 +621,21 @@ kuiper/source/op/encode.cpp   kuiper/source/model/model.cpp
 
 ```bash
 source tools/env.sh
-# 生成合成模型（需 numpy，本机在 miniconda 里）
-/home/tuesday/miniconda3/bin/python test/test_model/make_tiny_qwen35.py --out_dir /tmp/tiny35
-cp <某个真实 Qwen3.5 的 tokenizer.json> /tmp/tiny35/
-python3 tools/export_qwen35/export.py --model_dir /tmp/tiny35 \
-        --output /tmp/tiny35.bin --max_seq_len 128
-
-export LD_LIBRARY_PATH=$PWD/lib:$LD_LIBRARY_PATH GLOG_logtostderr=1
-export KUIPER_TINY_QWEN35=/tmp/tiny35.bin
-export KUIPER_TINY_QWEN35_TOKENIZER=/tmp/tiny35/tokenizer.json
-./build/test/test_llm --gtest_filter='Qwen35*'
+cmake -S . -B build -DUSE_CPM=ON -DQWEN35_SUPPORT=ON -DBUILD_TESTING=ON \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+      -DCMAKE_CUDA_ARCHITECTURES=89 -DCUDAToolkit_ROOT="$CUDA_HOME" \
+      -DPython3_EXECUTABLE=/home/tuesday/miniconda3/bin/python
+cmake --build build --target test_llm -j2
+ctest --test-dir build --output-on-failure --timeout 300
 ```
 
-未设这两个环境变量时，`Qwen35Tiny.*` 会 skip 而非失败，`ctest` 在没有合成模型的机器上仍能通过。
+CTest 的 `qwen35_tiny_fixture` setup 会自动生成 safetensors、确定性 tokenizer 和 BF16
+checkpoint，再为 `test_llm` 设置路径；无需下载或复制真实 tokenizer。本机结果为 CTest
+`2/2 passed`，内部 GTest `53/53 passed`，fixture 相关测试没有 skip。GitHub Actions 使用
+`self-hosted, linux, x64, gpu` runner 执行同一套 configure/build/ctest 命令；为避免不受信任
+的代码直接运行在自托管机器上，workflow 只响应仓库 push 和手动触发。当前仓库尚未注册
+self-hosted runner，远端 job 需要完成 runner 注册并添加 `gpu` 标签后才能实际调度；本次
+未自动安装常驻 runner 服务。
 
 ---
 

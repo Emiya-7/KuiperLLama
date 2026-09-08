@@ -15,8 +15,9 @@
 // models (full_attention_interval 4, 2 v-heads per k-head, partial_rotary_factor
 // 0.25) at a size that fits in a unit test.
 //
-// The checkpoint path comes from KUIPER_TINY_QWEN35; the tests skip when it is
-// unset so a plain `ctest` still passes on a machine without it.
+// CTest generates the checkpoint/tokenizer fixture and sets these environment
+// variables automatically. They remain overridable for direct test_llm runs;
+// without them only the fixture-dependent tests skip.
 namespace {
 
 const char* tiny_model_path() { return std::getenv("KUIPER_TINY_QWEN35"); }

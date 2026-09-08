@@ -11,6 +11,7 @@ endif()
 
 project(llama_infer CXX CUDA)
 include(cmake/cuda.cmake)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
@@ -64,6 +65,7 @@ if(USE_CPM)
     NAME Armadillo
     GITLAB_REPOSITORY conradsnicta/armadillo-code
     GIT_TAG 14.0.1
+    OPTIONS "BUILD_SMOKE_TEST Off"
   )
 
   CPMAddPackage(
@@ -124,5 +126,7 @@ if(USE_CPM)
 endif()
 
 set_target_properties(llama PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-add_subdirectory(test)
+if(BUILD_TESTING)
+  add_subdirectory(test)
+endif()
 add_subdirectory(demo)
