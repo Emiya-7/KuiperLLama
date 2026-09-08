@@ -8,10 +8,13 @@
 上与 Transformers FP32/eager 逐层对齐；Qwen3.5-4B 的真实 BF16 权重也已完成
 导出、Kuiper 端到端推理和 Transformers BF16 参考比较，覆盖了 4B 特有的 GDN
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
-8.41 GB，Kuiper 运行峰值内存约 8.0 GiB。当前共定义 52 个 GTest；本次环境无可用
-CUDA 设备，CUDA 对比测试会自动 skip，但全部新增 CUDA kernel 已通过编译。
+8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 52 个 GTest；RTX 4070
+SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通。全量测试仍有一个测试
+代码重复销毁 CUDA stream 的清理阶段崩溃，详见
+[`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 
-尚未完成的是 9B 独立 `lm_head` 的真实权重运行和 CUDA 真机验证，见「第 5 节」。
+尚未完成的是 9B 独立 `lm_head` 的真实权重运行和真实 4B CUDA 逐层 trace，见
+「第 5 节」。
 
 ---
 
@@ -300,9 +303,9 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 52 个 GTest。Qwen3.5 专项共 15 个；BF16 tiny checkpoint 下本次运行
-结果为 13 个通过，2 个 CUDA 对比因运行环境无可用设备而跳过。另有 Tensor BF16
-存储/转换、BF16 matmul 和 BF16 embedding 三个专项用例通过。
+当前共定义 52 个 GTest。Qwen3.5 tiny 的 CPU/CUDA 端到端对齐已在 RTX 4070 SUPER
+上通过；排除一个测试自身重复销毁 CUDA stream 的用例后，其余 51 项全部通过。
+Tensor BF16 存储/转换、BF16 matmul 和 BF16 embedding 专项用例也均通过。
 
 ### 4.6 真实 Qwen3.5-0.8B 对 Transformers（阶段 3）
 
@@ -387,6 +390,11 @@ Transformers BF16 会在层间把激活舍入回 BF16，而 Kuiper 只把大矩�
 参考工具现在直接加载 `Qwen3_5ForCausalLM` 文本塔，不再把未使用的 vision/MTP
 权重放入内存；`--dtype bf16` 用于本机无法容纳 FP32 4B reference 的场景。
 
+RTX 4070 SUPER（12,282 MiB，CUDA 12.8，sm_89）真机上，8.413 GB checkpoint
+成功完成 CUDA 加载和默认 prompt 的 21 步运行；forward/generation 阶段耗时
+0.513 秒，约 40.95 steps/s，含加载总耗时 7.22 秒。真实 CUDA 生成路径已经跑通，
+但逐层 trace runner 当前仍固定使用 CPU。
+
 ### 4.9 已发现并修复的实现错误
 
 **q_proj 的门拆分（严重）**。核对官方 `modeling_qwen3_5.py` 发现：
@@ -466,7 +474,8 @@ v:k=2:1 分组、32 层调度和 tied embedding 输出头。现在只剩 9B chec
   可在 15 GB 系统内存中运行。
 - 9B BF16 matrix 仍超过本机 GPU 和物理内存，需要 int8、更多内存或分层卸载。
 
-CUDA 运行尚未实测，因为本次容器无法访问 GPU；当前保证到 CUDA 12.8/sm_89 编译通过。
+CUDA 12.8/sm_89 已在 RTX 4070 SUPER 上完成 tiny CPU/CUDA 对齐和真实 4B 推理。
+Codex 默认沙箱不暴露 GPU，需要宿主权限运行；普通本机 WSL 终端不受此限制。
 
 ### 5.3 prompt 阶段逐 token 串行
 
