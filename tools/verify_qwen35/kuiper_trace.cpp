@@ -1,4 +1,5 @@
 #include <base/base.h>
+#include <cuda_runtime_api.h>
 #include <glog/logging.h>
 #include <algorithm>
 #include <cstdint>
@@ -30,22 +31,79 @@ std::string hidden_name(int32_t layer_idx) {
   return name;
 }
 
+const char* device_name(base::DeviceType device_type) {
+  return device_type == base::DeviceType::kDeviceCUDA ? "cuda" : "cpu";
+}
+
+void copy_float_tensor_to_host(const tensor::Tensor& source, float* destination, size_t count,
+                               base::DeviceType device_type, cudaStream_t stream) {
+  CHECK(source.data_type() == base::DataType::kDataTypeFp32);
+  CHECK_GE(source.size(), count);
+  CHECK(source.device_type() == device_type);
+  if (device_type == base::DeviceType::kDeviceCPU) {
+    std::copy_n(source.ptr<float>(), count, destination);
+    return;
+  }
+
+  CHECK_NE(stream, nullptr);
+  const cudaError_t copy_status =
+      cudaMemcpyAsync(destination, source.ptr<float>(), count * sizeof(float),
+                      cudaMemcpyDeviceToHost, stream);
+  CHECK_EQ(copy_status, cudaSuccess)
+      << "CUDA trace copy failed: " << cudaGetErrorString(copy_status);
+  const cudaError_t sync_status = cudaStreamSynchronize(stream);
+  CHECK_EQ(sync_status, cudaSuccess)
+      << "CUDA trace synchronization failed: " << cudaGetErrorString(sync_status);
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  if (argc < 4 || argc > 5) {
-    std::cerr << "Usage: qwen35_trace <checkpoint.bin> <tokenizer.json> <output_dir> [prompt]\n";
+  if (argc < 4) {
+    std::cerr << "Usage: qwen35_trace <checkpoint.bin> <tokenizer.json> <output_dir> "
+                 "[--device cpu|cuda] [prompt]\n";
     return 2;
   }
 
   const std::string checkpoint = argv[1];
   const std::string tokenizer = argv[2];
   const std::filesystem::path output_dir = argv[3];
-  const std::string prompt = argc == 5 ? argv[4] : kDefaultPrompt;
+  std::string prompt = kDefaultPrompt;
+  bool has_prompt = false;
+  base::DeviceType device_type = base::DeviceType::kDeviceCPU;
+  for (int arg_index = 4; arg_index < argc; ++arg_index) {
+    const std::string argument = argv[arg_index];
+    std::string requested_device;
+    if (argument == "--device") {
+      if (++arg_index >= argc) {
+        std::cerr << "--device requires cpu or cuda\n";
+        return 2;
+      }
+      requested_device = argv[arg_index];
+    } else if (argument.rfind("--device=", 0) == 0) {
+      requested_device = argument.substr(sizeof("--device=") - 1);
+    } else if (!has_prompt) {
+      prompt = argument;
+      has_prompt = true;
+      continue;
+    } else {
+      std::cerr << "Unexpected argument: " << argument << "\n";
+      return 2;
+    }
+
+    if (requested_device == "cpu") {
+      device_type = base::DeviceType::kDeviceCPU;
+    } else if (requested_device == "cuda") {
+      device_type = base::DeviceType::kDeviceCUDA;
+    } else {
+      std::cerr << "Unsupported device '" << requested_device << "'; expected cpu or cuda\n";
+      return 2;
+    }
+  }
   std::filesystem::create_directories(output_dir);
 
   model::Qwen35Model qwen35(base::TokenizerType::kEncodeBpe, tokenizer, checkpoint, false);
-  const base::Status init_status = qwen35.init(base::DeviceType::kDeviceCPU);
+  const base::Status init_status = qwen35.init(device_type);
   if (!init_status) {
     std::cerr << "Model init failed: " << init_status.get_err_msg() << "\n";
     return 1;
@@ -70,11 +128,11 @@ int main(int argc, char* argv[]) {
         CHECK_LT(position, seq_len);
         CHECK_GE(layer_idx, 0);
         CHECK_LT(layer_idx, trace_layers);
-        CHECK(state.device_type() == base::DeviceType::kDeviceCPU);
         CHECK_EQ(state.size(), static_cast<size_t>(config.hidden_size));
         float* destination = hidden[layer_idx].data() +
                              static_cast<size_t>(position) * config.hidden_size;
-        std::copy_n(state.ptr<float>(), config.hidden_size, destination);
+        copy_float_tensor_to_host(state, destination, config.hidden_size, device_type,
+                                  qwen35.cuda_stream());
       });
 
   qwen35.reset_state();
@@ -91,8 +149,8 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     const auto& row = qwen35.get_buffer(model::ModelBufferType::kForwardOutput);
-    std::copy_n(row.ptr<float>(), config.vocab_size,
-                logits.data() + static_cast<size_t>(pos) * config.vocab_size);
+    copy_float_tensor_to_host(row, logits.data() + static_cast<size_t>(pos) * config.vocab_size,
+                              config.vocab_size, device_type, qwen35.cuda_stream());
   }
 
   std::vector<int32_t> generated;
@@ -123,6 +181,7 @@ int main(int argc, char* argv[]) {
   std::ofstream metadata(output_dir / "metadata.json");
   metadata << "{\n"
            << "  \"implementation\": \"kuiper\",\n"
+           << "  \"device\": \"" << device_name(device_type) << "\",\n"
            << "  \"sequence_length\": " << seq_len << ",\n"
            << "  \"hidden_size\": " << config.hidden_size << ",\n"
            << "  \"num_hidden_layers\": " << config.layer_num << ",\n"
@@ -132,7 +191,8 @@ int main(int argc, char* argv[]) {
            << "}\n";
   CHECK(metadata.good()) << "Failed to write metadata";
 
-  std::cout << "tokens=" << seq_len << " layers=" << config.layer_num
+  std::cout << "device=" << device_name(device_type) << " tokens=" << seq_len
+            << " layers=" << config.layer_num
             << " generated=" << generated.size() << " first_token=" << generated.front()
             << " trace_dir=" << output_dir << "\n";
   return 0;

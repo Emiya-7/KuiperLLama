@@ -17,7 +17,7 @@
   FP32。
 - Qwen3.5-0.8B 已与 Transformers FP32/eager 做逐层、logits 和生成序列严格对齐。
 - Qwen3.5-4B 官方权重已完整下载并通过官方 SHA-256 校验，已完成 CPU 推理、
-  Transformers BF16 参考比较和 RTX 4070 SUPER CUDA 真机推理。
+  Transformers BF16 参考比较、RTX 4070 SUPER CUDA 真机推理和 CUDA 逐层 trace。
 - 当前 4B CUDA 推理不会因 12 GB 显存不足而失败；实测 21 个位置的 forward/generation
   阶段为 0.513 秒，约 40.95 steps/s。
 
@@ -28,8 +28,8 @@
 - Qwen3.5-9B 的独立 `lm_head` 虽然已经实现导出/加载分支，但没有真实权重验证；
 - 9B BF16 文本权重约 18 GB，超过本机 12 GB 显存和 15 GB 物理内存，需要 INT8、
   分层卸载或更大设备；
-- CUDA 的真实 4B 逐层 trace 工具尚未实现，当前真实 4B CUDA 验证是生成结果验证，
-  逐层数值对齐由 4B CPU/HF 和 tiny CPU/CUDA 两条测试共同覆盖；
+- 真实 4B CUDA 的 33 个 hidden 观测点、完整 logits 和 10-token generation 已分别
+  与 Kuiper CPU、Transformers BF16 trace 对齐；
 - 全量 52 项测试已在 RTX 4070 SUPER 上全部通过。
 
 更细的架构推导、张量形状和公式见 [`QWEN35_STATUS.md`](QWEN35_STATUS.md)。本文重点
@@ -79,7 +79,7 @@ Qwen3.5 当成接近 Qwen3 的普通 attention 模型，这个前提不成立。
 | BF16 Tensor/权重 | 无 | Tensor、matmul、embedding、导出器、loader 均支持 |
 | tied embedding | CPU 指针可复用，CUDA 可能重复上传 | CUDA 共享同一设备 Tensor，避免重复大表 |
 | tokenizer | GPT-2 byte-level 空格处理错误 | 已与 Transformers 的 12-token chat prompt 对齐 |
-| 真实模型验证 | 缺失 | 0.8B 严格对齐，4B CPU/HF + CUDA 真机跑通 |
+| 真实模型验证 | 缺失 | 0.8B 严格对齐，4B CPU/CUDA/HF 逐层对齐 |
 | CUDA 工具链 | 系统默认 11.5，不支持 sm_89 | 用户默认 CUDA 12.8，项目编译到 sm_89 |
 
 ---
@@ -254,6 +254,8 @@ CUDA 编译命令含：
 - Transformers reference 改为只加载 `Qwen3_5ForCausalLM` 文本塔，避免加载 vision/MTP。
 - reference 增加 `--dtype bf16`，使 4B 可以在本机内存中完成参考计算。
 - 完成真实 4B CPU、HF BF16 和 RTX 4070 SUPER CUDA 推理。
+- `qwen35_trace` 增加 `--device cpu|cuda`，CUDA 模式在模型 stream 上逐层 D2H 并同步。
+- 完成真实 4B CUDA hidden/logits 与 Kuiper CPU、Transformers BF16 的逐层比较。
 
 ---
 
@@ -388,9 +390,9 @@ Transformers BF16 会在层间舍入激活，Kuiper 只以 BF16 保存大矩阵�
 - `nvidia-smi` 正常识别 RTX 4070 SUPER；
 - PyTorch 2.10.0+cu128 返回 `torch.cuda.is_available() == True`；
 - 最小 CUDA kernel 测试通过；
-- 除已知测试生命周期错误外的 51 项测试全部通过；
 - `Qwen35Tiny.CudaMatchesCpu` 独立通过；
 - 真实 8.413 GB Qwen3.5-4B checkpoint CUDA 加载和生成成功。
+- 完整 52 项测试全部通过。
 
 4B CUDA 实测：
 
@@ -414,7 +416,26 @@ host max RSS: 8,428,820 KB
 
 进程结束后显存恢复到基线附近，未发现 8 GB 级设备权重泄漏。
 
-### 6.5 测试状态
+### 6.5 真实 4B CUDA 逐层 trace
+
+`qwen35_trace` 现在支持 `--device cpu|cuda`，默认仍为 CPU。CUDA 模式不会直接读取
+device 指针，而是在模型自己的非默认 stream 上提交 D2H copy，并在每一个 decoder
+hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会记录所选设备。
+
+真实 4B CUDA trace 保存了 12-token prompt 的 32 层 decoder hidden、final norm、
+完整 248320 维 logits 和随后 10 个 greedy token。实测含权重加载总耗时 7.29 秒，
+峰值主机 RSS `8,429,096 KB`。
+
+| 对比 | decoder 最大相对误差 | final norm 相对误差 | logits 相对误差 | 10 tokens |
+|---|---:|---:|---:|---|
+| CUDA vs Kuiper CPU | `2.07594e-05` | `2.88499e-06` | `2.63144e-06` | 完全一致 |
+| CUDA vs Transformers BF16 | `1.86247e-02` | `8.05090e-03` | `1.32916e-02` | 完全一致 |
+
+前者远低于 Kuiper CPU/CUDA 对比阈值 `2e-3`；后者低于 BF16 reference 阈值
+`2e-2`。tiny BF16 checkpoint 的 CUDA vs CPU decoder 最大相对误差为
+`3.22618e-06`，logits 相对误差为 `3.77925e-06`，10 个 token 同样完全一致。
+
+### 6.6 测试状态
 
 测试二进制当前包含 52 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
 `52/52 passed`，包括 `Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu` 和
@@ -435,14 +456,14 @@ host max RSS: 8,428,820 KB
 |---|---|---|
 | Qwen3.5-0.8B CPU FP32/BF16 | 已实现并严格验证 | 与 HF 逐层/logits/token 对齐 |
 | Qwen3.5-4B CPU BF16 | 已实现并验证 | 真实权重与 HF BF16 比较通过 |
-| Qwen3.5-4B CUDA BF16 | 已实现并真机运行 | 4070 SUPER 生成成功 |
+| Qwen3.5-4B CUDA BF16 | 已实现并严格验证 | 4070 SUPER 逐层/logits/token 与 CPU/HF 对齐 |
 | GDN v:k=1:1 | 已验证 | 0.8B 真实模型 |
 | GDN v:k=2:1 | 已验证 | tiny CPU/CUDA + 4B 真实模型 |
 | tied embedding | 已验证 | 0.8B/4B，CUDA 设备权重共享 |
 | checkpoint v2 FP32 | 已实现并回归验证 | 保持旧格式兼容 |
 | checkpoint v3 BF16 matrix | 已实现并验证 | 0.8B/4B |
 | 9B 独立 `lm_head` | 已编码，未真实验证 | 需要 9B 权重和更低精度/更大内存 |
-| 真实 4B CUDA 逐层 trace | 未实现 | trace runner 当前硬编码 CPU |
+| 真实 4B CUDA 逐层 trace | 已实现并验证 | 同一工具支持 CPU/CUDA，真实 4B 三方比较通过 |
 | Qwen3.5 INT8 | 未实现 | 9B 本机运行的关键前置项 |
 | 并行/分块 prefill | 未实现 | 长 prompt 性能关键项 |
 | batch > 1 | 未实现 | 继承框架现有限制 |
@@ -456,15 +477,11 @@ host max RSS: 8,428,820 KB
 
 ### P1：影响验证完整性或更大模型
 
-1. **真实 CUDA trace 缺失**
-   - `qwen35_trace` 当前固定 CPU，hidden callback 也要求 CPU Tensor。
-   - 应增加 `--device cpu|cuda`，CUDA trace 时按层同步并复制到 host。
-
-2. **INT8 未实现**
+1. **INT8 未实现**
    - 9B BF16 约 18 GB，无法在 12 GB 4070 SUPER 上常驻。
    - 建议优先做 weight-only INT8：embedding、matmul、checkpoint v4/量化元数据。
 
-3. **测试未接入 CTest**
+2. **测试未接入 CTest**
    - CI 或开发者执行 `ctest` 会误以为没有测试。
    - 应在 `test/CMakeLists.txt` 中启用并注册 `test_llm`，同时提供 tiny fixture。
 
@@ -617,14 +634,13 @@ KUIPER_TINY_QWEN35_TOKENIZER=/home/tuesday/workspace/icd/models/Qwen__Qwen3.5-0.
 
 ## 10. 建议的后续开发顺序
 
-1. 给 `qwen35_trace` 增加 CUDA 模式，用真实 4B 保存逐层 hidden/logits，与 CPU/HF 比较。
-2. 为新 CUDA kernel 统一增加 launch error 检查，并增加 BF16 大尺寸 matmul 专项测试。
-3. 将 `test_llm` 和 tiny fixture 接入 CTest/CI。
-4. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
+1. 为新 CUDA kernel 统一增加 launch error 检查，并增加 BF16 大尺寸 matmul 专项测试。
+2. 将 `test_llm` 和 tiny fixture 接入 CTest/CI。
+3. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
    tiled kernel。
-5. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
-6. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
-7. 下载并验证 9B 独立 `lm_head` 路径。
+4. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
+5. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
+6. 下载并验证 9B 独立 `lm_head` 路径。
 
 建议继续遵守“一项完整功能一个 commit”的规则：实现、测试、文档属于同一功能时放入
 同一个 commit；互不依赖的修复和优化分别提交。

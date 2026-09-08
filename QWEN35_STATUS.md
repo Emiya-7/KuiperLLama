@@ -10,9 +10,11 @@
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
 8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 52 个 GTest；RTX 4070
 SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测试结果为
-52/52 passed。详细结果见 [`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
+52/52 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
+分别与 Kuiper CPU、Transformers BF16 对齐。详细结果见
+[`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 
-尚未完成的是 9B 独立 `lm_head` 的真实权重运行和真实 4B CUDA 逐层 trace，见
+尚未完成的是 9B 独立 `lm_head` 的真实权重运行、INT8 和长 prompt 分块 prefill，见
 「第 5 节」。
 
 ---
@@ -390,8 +392,14 @@ Transformers BF16 会在层间把激活舍入回 BF16，而 Kuiper 只把大矩�
 
 RTX 4070 SUPER（12,282 MiB，CUDA 12.8，sm_89）真机上，8.413 GB checkpoint
 成功完成 CUDA 加载和默认 prompt 的 21 步运行；forward/generation 阶段耗时
-0.513 秒，约 40.95 steps/s，含加载总耗时 7.22 秒。真实 CUDA 生成路径已经跑通，
-但逐层 trace runner 当前仍固定使用 CPU。
+0.513 秒，约 40.95 steps/s，含加载总耗时 7.22 秒。
+
+`qwen35_trace` 已增加 `--device cpu|cuda`。CUDA 模式在模型自有 stream 上逐层复制
+并同步，真实 4B 保存了 32 层 decoder hidden、final norm、完整 logits 和 10 个生成
+token。CUDA vs Kuiper CPU 的 decoder 最大相对误差为 `2.07594e-05`、logits 为
+`2.63144e-06`；CUDA vs Transformers BF16 分别为 `1.86247e-02` 和
+`1.32916e-02`，两组比较的 10 个 token 均完全一致。CUDA trace 含加载总耗时
+7.29 秒，峰值主机 RSS `8,429,096 KB`。
 
 ### 4.9 已发现并修复的实现错误
 
@@ -472,7 +480,8 @@ v:k=2:1 分组、32 层调度和 tied embedding 输出头。现在只剩 9B chec
   可在 15 GB 系统内存中运行。
 - 9B BF16 matrix 仍超过本机 GPU 和物理内存，需要 int8、更多内存或分层卸载。
 
-CUDA 12.8/sm_89 已在 RTX 4070 SUPER 上完成 tiny CPU/CUDA 对齐和真实 4B 推理。
+CUDA 12.8/sm_89 已在 RTX 4070 SUPER 上完成 tiny CPU/CUDA 对齐、真实 4B 推理和
+真实 4B CUDA/CPU/HF 逐层 trace 对齐。
 Codex 默认沙箱不暴露 GPU，需要宿主权限运行；普通本机 WSL 终端不受此限制。
 
 ### 5.3 prompt 阶段逐 token 串行
