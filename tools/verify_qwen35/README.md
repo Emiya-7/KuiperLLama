@@ -68,3 +68,6 @@ The reference tool loads only the checkpoint's text tower, leaving the vision
 and MTP weights on disk. It uses FP32 by default for strict numerical alignment.
 For models that do not fit in host memory after FP32 widening, pass
 `--dtype bf16`; trace files are still widened to FP32 before they are written.
+Because Transformers rounds intermediate activations to BF16 while Kuiper keeps
+them in FP32, use `--relative_tolerance 2e-2` when comparing that BF16 reference.
+The generated-token sequence must still match exactly.
