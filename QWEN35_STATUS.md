@@ -356,6 +356,9 @@ Kuiper 标量/Armadillo 与 PyTorch 的 FP32 累加顺序不同。
 
 通过 `hf-mirror.com` 下载两片官方 safetensors 后，检查了每个张量的 dtype、shape、
 数据区间与分片边界；738 个源张量及索引声明的 `9,319,737,856` 字节完全一致。
+两片文件的 SHA-256 也分别与官方 LFS 元数据一致：
+`26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61` 和
+`cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188`。
 导出器 dry-run 验证了 Kuiper 使用的 426 个文本塔张量，随后生成 8.413 GB 的 v3
 BF16-matrix checkpoint。
 
