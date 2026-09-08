@@ -30,7 +30,7 @@
   分层卸载或更大设备；
 - CUDA 的真实 4B 逐层 trace 工具尚未实现，当前真实 4B CUDA 验证是生成结果验证，
   逐层数值对齐由 4B CPU/HF 和 tiny CPU/CUDA 两条测试共同覆盖；
-- 全量 52 项测试中有 1 项测试代码重复销毁 CUDA stream，会在 WSL 驱动中段错误。
+- 全量 52 项测试已在 RTX 4070 SUPER 上全部通过。
 
 更细的架构推导、张量形状和公式见 [`QWEN35_STATUS.md`](QWEN35_STATUS.md)。本文重点
 记录从初始状态到现在完成了什么、实际验证到哪里、剩余问题和可直接执行的命令。
@@ -416,23 +416,13 @@ host max RSS: 8,428,820 KB
 
 ### 6.5 测试状态
 
-测试二进制当前包含 52 项。带 tiny fixture、在宿主 GPU 权限下运行的结果：
+测试二进制当前包含 52 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
+`52/52 passed`，包括 `Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu` 和
+`Qwen35Tiny.CudaMatchesCpu`。
 
-- 排除 `Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu` 后：`51/51 passed`；
-- `Qwen35Tiny.CudaMatchesCpu`：单独通过；
-- 全量 52 项会在 RMSNorm 测试退出时发生 SIGSEGV。
-
-崩溃原因已经由 cuda-gdb 调用栈确定：
-
-1. [`test/test_op/test_qwen35_norm.cpp`](test/test_op/test_qwen35_norm.cpp) 手动调用
-   `cudaStreamDestroy(cuda_config->stream)`；
-2. [`kuiper/include/base/cuda_config.h`](kuiper/include/base/cuda_config.h) 中
-   `CudaConfig::~CudaConfig()` 随后再次销毁同一 stream；
-3. WSL `libcuda.so` 在第二次销毁无效句柄时段错误。
-
-kernel 已执行、同步和完成数值断言，崩溃发生在清理阶段。应删除测试中的手动销毁，
-或销毁后把 `cuda_config->stream` 置为 `nullptr`。本报告任务只要求分析和记录，尚未修改
-该测试。
+此前 RMSNorm CUDA 测试会在完成数值断言后发生 SIGSEGV。cuda-gdb 定位到测试手动
+调用 `cudaStreamDestroy` 后，`CudaConfig::~CudaConfig()` 又销毁同一 stream。测试中的
+手动销毁已经删除，现在由 `CudaConfig` 保持唯一所有权并负责析构清理。
 
 此外，项目当前没有向 CTest 注册测试，所以 `ctest --test-dir build` 会显示
 `No tests were found`；必须直接执行 `build/test/test_llm`。这是测试基础设施缺口。
@@ -463,13 +453,6 @@ kernel 已执行、同步和完成数值断言，崩溃发生在清理阶段。�
 ---
 
 ## 8. 当前问题和风险优先级
-
-### P0：应立即修复
-
-1. **CUDA RMSNorm 测试双重销毁 stream**
-   - 影响：全量测试无法得到 52/52 green。
-   - 范围：测试代码，一行级修复；模型推理本身不受影响。
-   - 修复后应重新运行全部 52 项并单独提交 commit。
 
 ### P1：影响验证完整性或更大模型
 
@@ -620,29 +603,28 @@ KV cache 和 score buffer；在 12 GB 显存上应逐级测试 512、2048、4096
   --weight_dtype bf16
 ```
 
-在修复双重 stream destroy 前，运行其余 51 项：
+运行全部 52 项：
 
 ```bash
 GLOG_logtostderr=1 \
 KUIPER_TINY_QWEN35=/tmp/kuiper-qwen35-stage4-tiny-bf16.bin \
 KUIPER_TINY_QWEN35_TOKENIZER=/home/tuesday/workspace/icd/models/Qwen__Qwen3.5-0.8B/tokenizer.json \
 ./build/test/test_llm \
-  --gtest_filter='-Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu'
+  --gtest_color=yes
 ```
 
 ---
 
 ## 10. 建议的后续开发顺序
 
-1. 修复 RMSNorm CUDA 测试中的 stream 双重销毁，确保 52/52 tests passed，并单独提交。
-2. 给 `qwen35_trace` 增加 CUDA 模式，用真实 4B 保存逐层 hidden/logits，与 CPU/HF 比较。
-3. 为新 CUDA kernel 统一增加 launch error 检查，并增加 BF16 大尺寸 matmul 专项测试。
-4. 将 `test_llm` 和 tiny fixture 接入 CTest/CI。
-5. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
+1. 给 `qwen35_trace` 增加 CUDA 模式，用真实 4B 保存逐层 hidden/logits，与 CPU/HF 比较。
+2. 为新 CUDA kernel 统一增加 launch error 检查，并增加 BF16 大尺寸 matmul 专项测试。
+3. 将 `test_llm` 和 tiny fixture 接入 CTest/CI。
+4. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
    tiled kernel。
-6. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
-7. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
-8. 下载并验证 9B 独立 `lm_head` 路径。
+5. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
+6. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
+7. 下载并验证 9B 独立 `lm_head` 路径。
 
 建议继续遵守“一项完整功能一个 commit”的规则：实现、测试、文档属于同一功能时放入
 同一个 commit；互不依赖的修复和优化分别提交。

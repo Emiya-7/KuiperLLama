@@ -9,9 +9,8 @@
 导出、Kuiper 端到端推理和 Transformers BF16 参考比较，覆盖了 4B 特有的 GDN
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
 8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 52 个 GTest；RTX 4070
-SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通。全量测试仍有一个测试
-代码重复销毁 CUDA stream 的清理阶段崩溃，详见
-[`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
+SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测试结果为
+52/52 passed。详细结果见 [`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 
 尚未完成的是 9B 独立 `lm_head` 的真实权重运行和真实 4B CUDA 逐层 trace，见
 「第 5 节」。
@@ -303,9 +302,8 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 52 个 GTest。Qwen3.5 tiny 的 CPU/CUDA 端到端对齐已在 RTX 4070 SUPER
-上通过；排除一个测试自身重复销毁 CUDA stream 的用例后，其余 51 项全部通过。
-Tensor BF16 存储/转换、BF16 matmul 和 BF16 embedding 专项用例也均通过。
+当前共定义 52 个 GTest，已在 RTX 4070 SUPER 上全部通过，包括 Qwen3.5 tiny 的
+CPU/CUDA 端到端对齐、Tensor BF16 存储/转换、BF16 matmul 和 BF16 embedding。
 
 ### 4.6 真实 Qwen3.5-0.8B 对 Transformers（阶段 3）
 
