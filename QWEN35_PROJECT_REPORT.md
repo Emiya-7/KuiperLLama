@@ -461,12 +461,13 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 调用 `cudaStreamDestroy` 后，`CudaConfig::~CudaConfig()` 又销毁同一 stream。测试中的
 手动销毁已经删除，现在由 `CudaConfig` 保持唯一所有权并负责析构清理。
 
-CTest 现在注册两个项目测试：`qwen35_tiny_fixture` 和 `test_llm`。前者无需下载外部
-模型，会生成 108 个张量的 tiny safetensors、保持真实 248070 有效 ID 边界的确定性
-tokenizer，并导出约 66 MB 的 BF16 checkpoint；后者通过 `FIXTURES_REQUIRED` 自动获得
-模型和 tokenizer 路径。即使执行 `ctest -R '^test_llm$'`，CTest 也会自动补跑 setup。
+CTest 现在注册四个项目测试：`qwen35_tiny_fixture`、`test_llm`、CPU matmul benchmark
+smoke 和 CPU GDN benchmark smoke。fixture 无需下载外部模型，会生成 108 个张量的 tiny
+safetensors、保持真实 248070 有效 ID 边界的确定性 tokenizer，并导出约 66 MB 的 BF16
+checkpoint；`test_llm` 通过 `FIXTURES_REQUIRED` 自动获得模型和 tokenizer 路径。即使
+执行 `ctest -R '^test_llm$'`，CTest 也会自动补跑 setup。
 
-本机验证结果为 CTest `2/2 passed`，其中 `test_llm` 内部为 `53/53 passed`，fixture
+本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `53/53 passed`，fixture
 相关 tokenizer/CPU/CUDA 测试均实际执行，没有因环境变量缺失而 skip。
 
 `.github/workflows/qwen35-ci.yml` 在 `main`、`feat/**` push 和手动触发时，使用标签为
@@ -505,22 +506,25 @@ pull request 代码直接落到自托管机器执行。
 
 ## 8. 当前问题和风险优先级
 
-### P1：影响验证完整性或更大模型
+### P1：当前 4B 算子优化
 
-1. **INT8 未实现**
-   - 9B BF16 约 18 GB，无法在 12 GB 4070 SUPER 上常驻。
-   - 建议优先做 weight-only INT8：embedding、matmul、checkpoint v4/量化元数据。
+1. Windows 驱动尚未开放 GPU performance counter，NCU `detailed` 基线被
+   `ERR_NVGPUCTRPERM` 阻塞。
+2. BF16 CUDA 单 token 投影仍是自研 GEMV，未使用 Tensor Core/cuBLASLt。
+3. GDN state 更新需要依据 NCU 数据确认内存带宽、occupancy 和 stall 瓶颈后再优化。
+4. prompt 仍逐 token 串行；分块 prefill 及真正的多行 GEMM 未实现。
 
 ### P2：性能和工程质量
 
-1. BF16 CUDA matmul 没有使用 Tensor Core/cuBLASLt。
-2. CPU BF16 matmul没有 BLAS 优化。
-3. GDN prompt 逐 token 串行，长 prompt 性能差。
-4. GDN state 两趟扫描可融合。
-5. 旧 CUDA kernel 尚未全部迁移到统一 launch error helper。
-6. conv state 可改环形缓冲。
-7. `view()` 是不拥有内存的 Tensor，生命周期依赖模型 buffer 长期存在。
-8. demo prompt 硬编码为 `What is AI?`，命令行不能直接输入任意 prompt。
+1. CPU BF16 matmul 没有 BLAS 优化。
+2. conv state 可改环形缓冲。
+3. `view()` 是不拥有内存的 Tensor，生命周期依赖模型 buffer 长期存在。
+4. demo prompt 硬编码为 `What is AI?`，命令行不能直接输入任意 prompt。
+
+### 暂缓项
+
+INT8、9B checkpoint 和 9B 独立 `lm_head` 的真实验证暂缓。9B BF16 文本权重约 18 GB，
+超过本机 12 GB 显存和 15 GB 物理内存；这不是当前 4B 算子优化里程碑的阻塞项。
 
 ---
 
@@ -570,7 +574,7 @@ cmake --build build -j2
 当前可用文件：
 
 ```text
-checkpoint: /tmp/qwen35_4b_stage4_bf16.bin
+checkpoint: /home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/kuiper-qwen35-4b-bf16-seq1024.bin
 tokenizer : /home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/tokenizer.json
 ```
 
@@ -578,7 +582,7 @@ tokenizer : /home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/tokenizer.json
 
 ```bash
 GLOG_logtostderr=1 ./build/demo/qwen35_infer \
-  /tmp/qwen35_4b_stage4_bf16.bin \
+  /home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/kuiper-qwen35-4b-bf16-seq1024.bin \
   /home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/tokenizer.json \
   21
 ```
@@ -591,7 +595,7 @@ CPU 对照命令：
 
 ```bash
 GLOG_logtostderr=1 ./build/demo/qwen35_infer \
-  /tmp/qwen35_4b_stage4_bf16.bin \
+  /home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/kuiper-qwen35-4b-bf16-seq1024.bin \
   /home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/tokenizer.json \
   --cpu 21
 ```
@@ -602,19 +606,19 @@ GLOG_logtostderr=1 ./build/demo/qwen35_infer \
 
 ```bash
 MODEL_DIR=/home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B
-CHECKPOINT=/home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/kuiper-qwen35-4b-bf16-seq128.bin
+CHECKPOINT=/home/tuesday/workspace/icd/models/Qwen__Qwen3.5-4B/kuiper-qwen35-4b-bf16-seq1024.bin
 
 /home/tuesday/miniconda3/bin/python tools/export_qwen35/export.py \
   --model_dir "$MODEL_DIR" \
   --output "$CHECKPOINT" \
-  --max_seq_len 128 \
+  --max_seq_len 1024 \
   --weight_dtype bf16 \
   --dry_run
 
 /home/tuesday/miniconda3/bin/python tools/export_qwen35/export.py \
   --model_dir "$MODEL_DIR" \
   --output "$CHECKPOINT" \
-  --max_seq_len 128 \
+  --max_seq_len 1024 \
   --weight_dtype bf16
 ```
 
@@ -656,13 +660,21 @@ ctest --test-dir build --output-on-failure --timeout 300
 
 ---
 
-## 10. 建议的后续开发顺序
+## 10. 当前算子优化顺序
 
-1. 优化 BF16 matmul：优先评估 cuBLASLt BF16 weight + FP32 compute，或实现 Tensor Core
-   tiled kernel。
-2. 实现 GDN chunk prefill，解决长 prompt 逐 token 串行问题。
-3. 设计 Qwen3.5 INT8 checkpoint 和 kernel，目标是在 12 GB 4070 SUPER 上运行 9B。
-4. 下载并验证 9B 独立 `lm_head` 路径。
+1. 开启 Windows NVIDIA GPU performance counter 权限，完成 GDN 和代表性 BF16
+   GEMV 的 NCU `detailed` 基线。
+2. 根据 NCU 的内存流量、occupancy、warp stall 和指令数据优化 GDN，再用完全相同的
+   输入和命令复测。
+3. 优化 BF16 GEMV；按大投影、小输出投影和 `lm_head` 三种负载分别判断，避免只在
+   单一形状上得出结论。
+4. 实现分块/并行 prefill。届时输入从单向量扩展到多 token 矩阵，建立真正的 GEMM
+   基线并单独做 Tensor Core/cuBLASLt 或自研 tiled kernel 对比。
+
+本阶段只使用 Nsight Compute 做核心算子分析，不进行 Nsight Systems 时间线或整程序
+调度优化。9B、INT8 与 9B 独立 `lm_head` 真实权重验证因内存空间不足暂缓，不纳入当前
+里程碑。当前基线数据、采集命令和严格的前后对照规则见
+[`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md)。
 
 建议继续遵守“一项完整功能一个 commit”的规则：实现、测试、文档属于同一功能时放入
 同一个 commit；互不依赖的修复和优化分别提交。
@@ -686,5 +698,6 @@ ctest --test-dir build --output-on-failure --timeout 300
 | [`tools/export_qwen35/export.py`](tools/export_qwen35/export.py) | HF safetensors 到 Kuiper checkpoint |
 | [`demo/main_qwen35.cpp`](demo/main_qwen35.cpp) | Qwen3.5 CUDA/CPU 推理 demo |
 | [`tools/verify_qwen35/`](tools/verify_qwen35/) | Kuiper/HF trace 和比较工具 |
+| [`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md) | 4B 核心算子性能基线与 NCU 对照规则 |
 | [`kuiper/source/model/qwen35.cpp`](kuiper/source/model/qwen35.cpp) | 模型加载、buffer、forward、状态管理 |
 | [`kuiper/source/op/kernels/cuda/qwen35_kernel.cu`](kuiper/source/op/kernels/cuda/qwen35_kernel.cu) | Qwen3.5 CUDA kernel |

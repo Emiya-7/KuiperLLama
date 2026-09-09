@@ -1,6 +1,6 @@
 # Qwen3.5 Dense 支持：设计、现状与待办
 
-目标：用本框架跑通 Qwen3.5-4B（及 9B）的纯文本推理。
+目标：用本框架跑通并重点优化 Qwen3.5-4B 纯文本推理。9B 因本机内存限制暂缓。
 
 本文记录已完成的设计与实现、已验证到什么程度、存在哪些缺陷，以及达成目标还差什么。
 
@@ -14,8 +14,10 @@ SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测�
 分别与 Kuiper CPU、Transformers BF16 对齐。详细结果见
 [`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 
-尚未完成的是 9B 独立 `lm_head` 的真实权重运行、INT8 和长 prompt 分块 prefill，见
-「第 5 节」。
+当前开发重点已调整为 4B 核心 CUDA 算子：使用 Nsight Compute 对 GDN 与 BF16
+GEMV/MatMul 做优化前后对照。9B 独立 `lm_head`、INT8 暂停，长 prompt 分块 prefill
+仍未实现。性能基线与 NCU 权限状态见
+[`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md)。
 
 ---
 
@@ -631,7 +633,8 @@ ctest --test-dir build --output-on-failure --timeout 300
 
 CTest 的 `qwen35_tiny_fixture` setup 会自动生成 safetensors、确定性 tokenizer 和 BF16
 checkpoint，再为 `test_llm` 设置路径；无需下载或复制真实 tokenizer。本机结果为 CTest
-`2/2 passed`，内部 GTest `53/53 passed`，fixture 相关测试没有 skip。GitHub Actions 使用
+`4/4 passed`（含 matmul/GDN benchmark smoke），内部 GTest `53/53 passed`，fixture
+相关测试没有 skip。GitHub Actions 使用
 `self-hosted, linux, x64, gpu` runner 执行同一套 configure/build/ctest 命令；为避免不受信任
 的代码直接运行在自托管机器上，workflow 只响应仓库 push 和手动触发。当前仓库尚未注册
 self-hosted runner，远端 job 需要完成 runner 注册并添加 `gpu` 标签后才能实际调度；本次
