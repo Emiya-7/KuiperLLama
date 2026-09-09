@@ -1,0 +1,6 @@
+/build/
+/lib/
+__pycache__/
+*.pyc
+*.ncu-rep
+/benchmarks/qwen35/results/
