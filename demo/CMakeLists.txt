@@ -65,5 +65,11 @@ elseif (QWEN35_SUPPORT)
                 --m 64 --k 32 --warmup 0 --repeat 2
         )
         set_tests_properties(qwen35_bench_smoke PROPERTIES LABELS "benchmark;qwen35")
+        add_test(
+            NAME qwen35_gdn_bench_smoke
+            COMMAND $<TARGET_FILE:qwen35_bench>
+                --mode gdn --device cpu --warmup 0 --repeat 1
+        )
+        set_tests_properties(qwen35_gdn_bench_smoke PROPERTIES LABELS "benchmark;qwen35")
     endif()
 endif ()

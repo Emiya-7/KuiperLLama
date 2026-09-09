@@ -51,6 +51,21 @@ benchmarks/qwen35/scripts/run_matmul_baseline.sh \
 Set `CACHE_MODES="cold warm"` only when collecting an explicitly separate cache
 study.
 
+## GDN microbenchmark
+
+The standalone GDN mode exercises exactly one `gated_delta_step_kernel` launch
+with the Qwen3.5-4B dimensions: 16 K heads, 32 V heads, 128-wide K/V heads, and
+a 2 MiB recurrent state. It does not load model weights. State is reset before
+every sample, and CUDA output/state are checked against the CPU implementation.
+
+```bash
+./build/demo/qwen35_bench \
+  --mode gdn --device cuda --warmup 5 --repeat 30 \
+  --output /tmp/qwen35-gdn-baseline.json
+```
+
+Use `--warmup 0 --repeat 1` under NCU so exactly one target kernel is collected.
+
 ## Model benchmark
 
 Model loading and weight upload are reported separately as `load_ms`. Every

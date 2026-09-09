@@ -22,6 +22,7 @@
 #include "base/nvtx.h"
 #include "model/qwen35.h"
 #include "op/matmul.h"
+#include "op/qwen35_ops.h"
 
 #ifndef KUIPER_BUILD_TYPE
 #define KUIPER_BUILD_TYPE "unknown"
@@ -99,6 +100,8 @@ std::string current_git_commit() {
       << "  " << program
       << " --mode matmul [--m 2560] [--k 4096] [--dtype bf16|fp32]\n"
       << "  " << program
+      << " --mode gdn [--device cuda|cpu]\n"
+      << "  " << program
       << " --mode prefill|decode|end-to-end --checkpoint MODEL --tokenizer TOKENIZER\n\n"
       << "Common options:\n"
       << "  --device cuda|cpu       Execution device (default: cuda)\n"
@@ -171,9 +174,9 @@ Options parse_options(int argc, char** argv) {
     }
   }
 
-  if (options.mode != "matmul" && options.mode != "prefill" && options.mode != "decode" &&
-      options.mode != "end-to-end") {
-    throw std::runtime_error("--mode must be matmul, prefill, decode, or end-to-end");
+  if (options.mode != "matmul" && options.mode != "gdn" && options.mode != "prefill" &&
+      options.mode != "decode" && options.mode != "end-to-end") {
+    throw std::runtime_error("--mode must be matmul, gdn, prefill, decode, or end-to-end");
   }
   if (options.device != "cuda" && options.device != "cpu") {
     throw std::runtime_error("--device must be cuda or cpu");
@@ -184,7 +187,8 @@ Options parse_options(int argc, char** argv) {
   if (options.cache != "cold" && options.cache != "warm") {
     throw std::runtime_error("--cache must be cold or warm");
   }
-  if (options.mode != "matmul" && (options.checkpoint.empty() || options.tokenizer.empty())) {
+  if (options.mode != "matmul" && options.mode != "gdn" &&
+      (options.checkpoint.empty() || options.tokenizer.empty())) {
     throw std::runtime_error("model modes require --checkpoint and --tokenizer");
   }
   return options;
@@ -413,6 +417,163 @@ struct MatmulResults {
   size_t cache_flush_bytes = 0;
 };
 
+struct GdnResults {
+  Stats elapsed;
+  double output_checksum = 0.0;
+  double state_checksum = 0.0;
+  double max_abs_error = 0.0;
+  size_t state_bytes = 0;
+};
+
+GdnResults benchmark_gdn(const Options& options, base::DeviceType device) {
+  // Qwen3.5-4B GDN dimensions from config.json. Keeping this fixture fixed makes
+  // before/after NCU reports directly comparable and avoids loading an 8.4 GiB checkpoint.
+  constexpr int32_t kNumKHeads = 16;
+  constexpr int32_t kNumVHeads = 32;
+  constexpr int32_t kHeadDim = 128;
+  constexpr int32_t kValueDim = 128;
+  constexpr int32_t kQKSize = kNumKHeads * kHeadDim;
+  constexpr int32_t kValueSize = kNumVHeads * kValueDim;
+  constexpr int32_t kStateSize = kNumVHeads * kHeadDim * kValueDim;
+
+  const auto cpu_alloc = base::CPUDeviceAllocatorFactory::get_instance();
+  tensor::Tensor q(base::DataType::kDataTypeFp32, kQKSize, true, cpu_alloc);
+  tensor::Tensor k(base::DataType::kDataTypeFp32, kQKSize, true, cpu_alloc);
+  tensor::Tensor v(base::DataType::kDataTypeFp32, kValueSize, true, cpu_alloc);
+  tensor::Tensor g(base::DataType::kDataTypeFp32, kNumVHeads, true, cpu_alloc);
+  tensor::Tensor beta(base::DataType::kDataTypeFp32, kNumVHeads, true, cpu_alloc);
+  tensor::Tensor state(base::DataType::kDataTypeFp32, kStateSize, true, cpu_alloc);
+
+  const float unit = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+  for (int32_t i = 0; i < kQKSize; ++i) {
+    q.index<float>(i) = unit;
+    k.index<float>(i) = unit;
+  }
+  for (int32_t i = 0; i < kValueSize; ++i) {
+    v.index<float>(i) = static_cast<float>(i % 37 - 18) / 64.0f;
+  }
+  for (int32_t i = 0; i < kNumVHeads; ++i) {
+    g.index<float>(i) = -0.125f - static_cast<float>(i % 3) / 32.0f;
+    beta.index<float>(i) = 0.5f + static_cast<float>(i % 5) / 32.0f;
+  }
+  std::fill(state.ptr<float>(), state.ptr<float>() + state.size(), 0.0f);
+
+  std::shared_ptr<kernel::CudaConfig> cuda_config;
+  std::shared_ptr<base::DeviceAllocator> output_alloc = cpu_alloc;
+  if (device == base::DeviceType::kDeviceCUDA) {
+    cuda_config = std::make_shared<kernel::CudaConfig>();
+    check_cuda(cudaStreamCreate(&cuda_config->stream), "cudaStreamCreate");
+    q.to_cuda(cuda_config->stream);
+    k.to_cuda(cuda_config->stream);
+    v.to_cuda(cuda_config->stream);
+    g.to_cuda(cuda_config->stream);
+    beta.to_cuda(cuda_config->stream);
+    state.to_cuda(cuda_config->stream);
+    output_alloc = base::CUDADeviceAllocatorFactory::get_instance();
+  }
+  tensor::Tensor output(base::DataType::kDataTypeFp32, kValueSize, true, output_alloc);
+
+  op::GatedDeltaLayer layer(device, kNumKHeads, kNumVHeads, kHeadDim, kValueDim);
+  layer.set_cuda_config(cuda_config);
+  layer.set_input(0, q);
+  layer.set_input(1, k);
+  layer.set_input(2, v);
+  layer.set_input(3, g);
+  layer.set_input(4, beta);
+  layer.set_input(5, state);
+  layer.set_output(0, output);
+
+  auto reset_state = [&] {
+    if (device == base::DeviceType::kDeviceCUDA) {
+      check_cuda(cudaMemsetAsync(state.ptr<float>(), 0, state.byte_size(), cuda_config->stream),
+                 "reset GDN state");
+    } else {
+      std::fill(state.ptr<float>(), state.ptr<float>() + state.size(), 0.0f);
+    }
+  };
+  auto workload = [&] {
+    base::ScopedNvtxRange range("gdn/step/nk16_nv32_k128_v128");
+    const base::Status status = layer.forward();
+    if (!status) {
+      throw std::runtime_error("GDN failed: " + status.get_err_msg());
+    }
+  };
+
+  for (int32_t i = 0; i < options.warmup; ++i) {
+    reset_state();
+    workload();
+  }
+  if (device == base::DeviceType::kDeviceCUDA) {
+    check_cuda(cudaStreamSynchronize(cuda_config->stream), "synchronize GDN warmup");
+  }
+
+  std::vector<double> samples;
+  samples.reserve(options.repeat);
+  for (int32_t i = 0; i < options.repeat; ++i) {
+    reset_state();
+    samples.push_back(measure_ms(device, device == base::DeviceType::kDeviceCUDA
+                                             ? cuda_config->stream
+                                             : nullptr,
+                                 workload));
+  }
+  if (device == base::DeviceType::kDeviceCUDA) {
+    output.to_cpu();
+    state.to_cpu();
+  }
+
+  GdnResults results;
+  results.elapsed = summarize(samples);
+  results.state_bytes = static_cast<size_t>(kStateSize) * sizeof(float);
+  for (int32_t i = 0; i < kValueSize; ++i) results.output_checksum += output.index<float>(i);
+  for (int32_t i = 0; i < kStateSize; ++i) results.state_checksum += state.index<float>(i);
+
+  if (device == base::DeviceType::kDeviceCUDA) {
+    tensor::Tensor q_ref(base::DataType::kDataTypeFp32, kQKSize, true, cpu_alloc);
+    tensor::Tensor k_ref(base::DataType::kDataTypeFp32, kQKSize, true, cpu_alloc);
+    tensor::Tensor v_ref(base::DataType::kDataTypeFp32, kValueSize, true, cpu_alloc);
+    tensor::Tensor g_ref(base::DataType::kDataTypeFp32, kNumVHeads, true, cpu_alloc);
+    tensor::Tensor beta_ref(base::DataType::kDataTypeFp32, kNumVHeads, true, cpu_alloc);
+    tensor::Tensor state_ref(base::DataType::kDataTypeFp32, kStateSize, true, cpu_alloc);
+    tensor::Tensor output_ref(base::DataType::kDataTypeFp32, kValueSize, true, cpu_alloc);
+    for (int32_t i = 0; i < kQKSize; ++i) {
+      q_ref.index<float>(i) = unit;
+      k_ref.index<float>(i) = unit;
+    }
+    for (int32_t i = 0; i < kValueSize; ++i) {
+      v_ref.index<float>(i) = static_cast<float>(i % 37 - 18) / 64.0f;
+    }
+    for (int32_t i = 0; i < kNumVHeads; ++i) {
+      g_ref.index<float>(i) = -0.125f - static_cast<float>(i % 3) / 32.0f;
+      beta_ref.index<float>(i) = 0.5f + static_cast<float>(i % 5) / 32.0f;
+    }
+    std::fill(state_ref.ptr<float>(), state_ref.ptr<float>() + state_ref.size(), 0.0f);
+    op::GatedDeltaLayer reference(base::DeviceType::kDeviceCPU, kNumKHeads, kNumVHeads, kHeadDim,
+                                  kValueDim);
+    reference.set_input(0, q_ref);
+    reference.set_input(1, k_ref);
+    reference.set_input(2, v_ref);
+    reference.set_input(3, g_ref);
+    reference.set_input(4, beta_ref);
+    reference.set_input(5, state_ref);
+    reference.set_output(0, output_ref);
+    const base::Status status = reference.forward();
+    if (!status) throw std::runtime_error("CPU GDN reference failed: " + status.get_err_msg());
+    for (int32_t i = 0; i < kValueSize; ++i) {
+      results.max_abs_error =
+          std::max(results.max_abs_error,
+                   std::abs(static_cast<double>(output.index<float>(i) -
+                                                output_ref.index<float>(i))));
+    }
+    for (int32_t i = 0; i < kStateSize; ++i) {
+      results.max_abs_error =
+          std::max(results.max_abs_error,
+                   std::abs(static_cast<double>(state.index<float>(i) -
+                                                state_ref.index<float>(i))));
+    }
+  }
+  return results;
+}
+
 MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) {
   const auto cpu_alloc = base::CPUDeviceAllocatorFactory::get_instance();
   const base::DataType weight_type = options.dtype == "bf16" ? base::DataType::kDataTypeBf16
@@ -575,7 +736,8 @@ void write_stats(std::ostream& out, const Stats& stats, int indent) {
 }
 
 std::string result_json(const Options& options, const RuntimeInfo& runtime,
-                        const MatmulResults* matmul, const ModelResults* model) {
+                        const MatmulResults* matmul, const GdnResults* gdn,
+                        const ModelResults* model) {
   std::ostringstream out;
   out << std::fixed << std::setprecision(6);
   out << "{\n"
@@ -608,6 +770,20 @@ std::string result_json(const Options& options, const RuntimeInfo& runtime,
         << "    \"median_gflops\": " << matmul->gflops << ",\n"
         << "    \"median_effective_gbps\": " << matmul->effective_gbps << ",\n"
         << "    \"output_checksum\": " << matmul->checksum << "\n"
+        << "  }\n";
+  } else if (gdn) {
+    out << "  \"gdn\": {\n"
+        << "    \"num_k_heads\": 16,\n"
+        << "    \"num_v_heads\": 32,\n"
+        << "    \"k_head_dim\": 128,\n"
+        << "    \"v_head_dim\": 128,\n"
+        << "    \"state_bytes\": " << gdn->state_bytes << ",\n"
+        << "    \"elapsed\": ";
+    write_stats(out, gdn->elapsed, 4);
+    out << ",\n"
+        << "    \"output_checksum\": " << gdn->output_checksum << ",\n"
+        << "    \"state_checksum\": " << gdn->state_checksum << ",\n"
+        << "    \"cpu_reference_max_abs_error\": " << gdn->max_abs_error << "\n"
         << "  }\n";
   } else {
     out << "  \"model\": {\n"
@@ -649,17 +825,22 @@ int main(int argc, char** argv) {
                                                               : base::DeviceType::kDeviceCPU;
     const RuntimeInfo runtime = runtime_info(device);
     MatmulResults matmul;
+    GdnResults gdn;
     ModelResults model;
     const MatmulResults* matmul_ptr = nullptr;
+    const GdnResults* gdn_ptr = nullptr;
     const ModelResults* model_ptr = nullptr;
     if (options.mode == "matmul") {
       matmul = benchmark_matmul(options, device);
       matmul_ptr = &matmul;
+    } else if (options.mode == "gdn") {
+      gdn = benchmark_gdn(options, device);
+      gdn_ptr = &gdn;
     } else {
       model = benchmark_model(options, device);
       model_ptr = &model;
     }
-    const std::string json = result_json(options, runtime, matmul_ptr, model_ptr);
+    const std::string json = result_json(options, runtime, matmul_ptr, gdn_ptr, model_ptr);
     std::cout << json;
     if (!options.output.empty()) {
       std::ofstream file(options.output);
