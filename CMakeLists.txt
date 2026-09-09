@@ -40,6 +40,7 @@ if (QWEN35_SUPPORT)
   message(STATUS "QWEN3.5 SUPPORT")
   add_definitions(-DQWEN35_SUPPORT)
 endif()
+option(KUIPER_ENABLE_NVTX "Enable NVTX annotations for CUDA profiling" ON)
 # ---- Add dependencies via CPM ----
 # see https://github.com/TheLartians/CPM.cmake for more info
 option(USE_CPM "Use CPM for dependency management" OFF)
@@ -113,6 +114,13 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 
 add_library(llama SHARED ${DIR_TENSOR} ${DIR_BASE} ${DIR_OP} ${DIR_KERNEL} ${DIR_MODEL} ${DIR_KERNEL_CPU} ${DIR_KERNEL_CUDA} ${DIR_KERNEL} ${DIR_SAMPLE})
 target_link_libraries(llama sentencepiece glog::glog gtest gtest_main pthread cudart armadillo)
+if(KUIPER_ENABLE_NVTX)
+  if(NOT TARGET CUDA::nvtx3)
+    message(FATAL_ERROR "KUIPER_ENABLE_NVTX requires the CUDA Toolkit nvtx3 target")
+  endif()
+  target_link_libraries(llama CUDA::nvtx3)
+  target_compile_definitions(llama PUBLIC KUIPER_ENABLE_NVTX)
+endif()
 target_link_directories(llama PUBLIC ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/lib64)
 
 target_include_directories(llama PUBLIC ${glog_INCLUDE_DIR})

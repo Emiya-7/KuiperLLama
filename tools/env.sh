@@ -6,6 +6,8 @@
 #   * The distro's CUDA is 11.5, which cannot target this GPU (sm_89 is not a
 #     valid -arch value before CUDA 11.8) and whose nvcc fails to parse GCC 11's
 #     <functional>. CUDA 12.8 is installed under ~/.local/opt to fix both.
+#   * The same CUDA 12.8 installation provides ncu and ncu-ui (Nsight Compute
+#     2025.1.1), so no separate profiler installation or PATH entry is needed.
 export CUDA_HOME="${CUDA_HOME:-$HOME/.local/opt/cuda-12.8}"
 export PATH="$HOME/.local/bin:$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH}"

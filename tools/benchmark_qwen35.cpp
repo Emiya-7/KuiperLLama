@@ -19,6 +19,7 @@
 
 #include "base/alloc.h"
 #include "base/bfloat16.h"
+#include "base/nvtx.h"
 #include "model/qwen35.h"
 #include "op/matmul.h"
 
@@ -322,8 +323,12 @@ ModelResults benchmark_model(const Options& options, base::DeviceType device) {
       check_cuda(cudaStreamSynchronize(model.cuda_stream()), "synchronize after state reset");
     }
   };
-  auto prefill_work = [&] { run_tokens(model, prompt, 0, true); };
+  auto prefill_work = [&] {
+    base::ScopedNvtxRange range("prefill");
+    run_tokens(model, prompt, 0, true);
+  };
   auto decode_work = [&] {
+    base::ScopedNvtxRange range("decode");
     for (int32_t i = 0; i < options.decode_steps; ++i) {
       run_tokens(model, {decode.at(i)}, options.prompt_length + i, false);
     }
@@ -352,6 +357,7 @@ ModelResults benchmark_model(const Options& options, base::DeviceType device) {
     double prefill_value = 0.0;
     double decode_value = 0.0;
     const double total_value = measure_ms(device, model.cuda_stream(), [&] {
+      base::ScopedNvtxRange range("end-to-end");
       prefill_work();
       decode_work();
     });
@@ -436,7 +442,11 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   if (!weight_status) {
     throw std::runtime_error("failed to bind matmul weight: " + weight_status.get_err_msg());
   }
+  const std::string range_name = "matmul/" + options.dtype + "/m" +
+                                 std::to_string(options.input_size) + "_k" +
+                                 std::to_string(options.output_size);
   auto workload = [&] {
+    base::ScopedNvtxRange range(range_name.c_str());
     // MatmulLayer::forward() hides Layer's convenience overloads, so dispatch
     // through the base type just as the model's shared_ptr<Layer> plumbing does.
     op::Layer& base_layer = layer;

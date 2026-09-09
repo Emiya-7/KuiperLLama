@@ -13,6 +13,7 @@ prefill implementation without changing the meaning of this baseline.
 ```bash
 source tools/env.sh
 cmake -S . -B build -DUSE_CPM=ON -DQWEN35_SUPPORT=ON \
+  -DKUIPER_ENABLE_NVTX=ON \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
   -DCMAKE_CUDA_ARCHITECTURES=89 \
@@ -60,3 +61,60 @@ phase timings are gathered in a separate reset run.
 Keep generated JSON and Nsight Compute reports outside Git. When publishing a
 result, record the Git commit, command, environment manifest, summary tables,
 and SHA-256 of the corresponding `.ncu-rep` artifact.
+
+## Nsight Compute
+
+CUDA 12.8 in `tools/env.sh` includes Nsight Compute CLI. Verify the selected
+installation before profiling:
+
+```bash
+source tools/env.sh
+ncu --version
+ncu --list-sets
+ncu --list-sections
+```
+
+On the current RTX 4070 SUPER workstation this resolves to Nsight Compute
+2025.1.1 (`ncu` and `ncu-ui`). The CLI and section discovery work, but the first
+counter collection returned `ERR_NVGPUCTRPERM`; the Windows-host permission
+step below must be completed before baseline reports can be collected.
+
+The build enables NVTX annotations by default. The `qwen35` domain contains
+top-level `prefill`, `decode`, `end-to-end`, and `matmul/...` ranges. Model
+ranges are nested by `layer_NN/gdn|full` and then by operator, for example
+`matmul.gdn_qkv`, `delta.gdn`, and `matmul.mlp_down`.
+
+Use application replay for the stateful model benchmark. The helper captures
+the environment, exports an NCU report, and creates its SHA-256 file:
+
+```bash
+benchmarks/qwen35/scripts/profile_ncu.sh \
+  /tmp/qwen35-ncu/matmul-baseline 'qwen35@matmul/' -- \
+  ./build/demo/qwen35_bench \
+    --mode matmul --device cuda --dtype bf16 \
+    --m 2560 --k 4096 --warmup 5 --repeat 5
+
+benchmarks/qwen35/scripts/profile_ncu.sh \
+  /tmp/qwen35-ncu/decode-baseline 'qwen35@decode/' -- \
+  ./build/demo/qwen35_bench \
+    --mode decode --device cuda \
+    --checkpoint /path/to/qwen35_4b_stage4_bf16.bin \
+    --tokenizer /path/to/Qwen3.5-4B/tokenizer.json \
+    --prompt-length 128 --decode-steps 4 --warmup 1 --repeat 1
+```
+
+Override `NCU_SET` and `NCU_REPLAY_MODE` only for targeted investigations. For
+example, an isolated stateless matmul can use `NCU_SET=detailed` and
+`NCU_REPLAY_MODE=kernel`; avoid that combination over an entire model run.
+
+If NCU reports `ERR_NVGPUCTRPERM` under WSL2, enable access on the Windows host:
+
+1. Open NVIDIA Control Panel as administrator.
+2. Enable **Desktop > Enable Developer Settings**.
+3. Open **Developer > Manage GPU Performance Counters**.
+4. Select **Allow access to the GPU performance counters to all users**.
+5. Restart WSL with `wsl --shutdown`, open it again, and rerun the command.
+
+The JSON from an NCU-instrumented run is not a latency result: replay and
+counter collection intentionally perturb execution. Use the standalone CUDA
+Event benchmark for latency and the `.ncu-rep` only for bottleneck evidence.
