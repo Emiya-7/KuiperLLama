@@ -4,6 +4,11 @@
 kernel optimizations. It deliberately does not use `qwen35_trace`: trace mode
 synchronizes and copies every selected hidden state, which changes the workload.
 
+The optimization case study is deliberately operator-scoped. Nsight Compute is
+used on a small set of GDN and BF16 matrix-vector kernels; Nsight Systems and
+whole-program timeline tuning are outside this work. Standalone model timing is
+retained only as an optional regression check.
+
 The current model prefill implementation is token-by-token. Results therefore
 label it `token-by-token-baseline`; a later optimization will add a batched
 prefill implementation without changing the meaning of this baseline.
@@ -94,7 +99,7 @@ Keep generated JSON and Nsight Compute reports outside Git. When publishing a
 result, record the Git commit, command, environment manifest, summary tables,
 and SHA-256 of the corresponding `.ncu-rep` artifact.
 
-## Nsight Compute
+## Operator-focused Nsight Compute
 
 CUDA 12.8 in `tools/env.sh` includes Nsight Compute CLI. Verify the selected
 installation before profiling:
@@ -111,33 +116,47 @@ On the current RTX 4070 SUPER workstation this resolves to Nsight Compute
 counter collection returned `ERR_NVGPUCTRPERM`; the Windows-host permission
 step below must be completed before baseline reports can be collected.
 
-The build enables NVTX annotations by default. The `qwen35` domain contains
-top-level `prefill`, `decode`, `end-to-end`, and `matmul/...` ranges. Model
-ranges are nested by `layer_NN/gdn|full` and then by operator, for example
-`matmul.gdn_qkv`, `delta.gdn`, and `matmul.mlp_down`.
-
-Use application replay for the stateful model benchmark. The helper captures
-the environment, exports an NCU report, and creates its SHA-256 file:
+The profiling helper filters by CUDA kernel function, profiles one matching
+launch, captures the environment, exports the `.ncu-rep`, writes a SHA-256, and
+also exports a reviewable raw CSV. Kernel replay is safe here because each
+microbenchmark has deterministic inputs and NCU restores memory modified by a
+replayed launch.
 
 ```bash
 benchmarks/qwen35/scripts/profile_ncu.sh \
-  /tmp/qwen35-ncu/matmul-baseline 'qwen35@matmul/' -- \
+  /tmp/qwen35-ncu/matmul-gdn-qkv '.*matmul_kernel_cu_fp32bf16.*' -- \
   ./build/demo/qwen35_bench \
     --mode matmul --device cuda --dtype bf16 \
-    --m 2560 --k 4096 --cache cold --warmup 5 --repeat 5
+    --m 2560 --k 8192 --cache cold --warmup 0 --repeat 1
 
 benchmarks/qwen35/scripts/profile_ncu.sh \
-  /tmp/qwen35-ncu/decode-baseline 'qwen35@decode/' -- \
-  ./build/demo/qwen35_bench \
-    --mode decode --device cuda \
-    --checkpoint /path/to/qwen35_4b_stage4_bf16.bin \
-    --tokenizer /path/to/Qwen3.5-4B/tokenizer.json \
-    --prompt-length 128 --decode-steps 4 --warmup 1 --repeat 1
+  /tmp/qwen35-ncu/gdn '.*gated_delta_step_kernel.*' -- \
+  ./build/demo/qwen35_bench --mode gdn --device cuda --warmup 0 --repeat 1
 ```
 
-Override `NCU_SET` and `NCU_REPLAY_MODE` only for targeted investigations. For
-example, an isolated stateless matmul can use `NCU_SET=detailed` and
-`NCU_REPLAY_MODE=kernel`; avoid that combination over an entire model run.
+The curated 4B suite can run all cases or selected cases:
+
+```bash
+benchmarks/qwen35/scripts/run_ncu_operator_baseline.sh /tmp/qwen35-ncu-baseline
+benchmarks/qwen35/scripts/run_ncu_operator_baseline.sh \
+  /tmp/qwen35-ncu-baseline gdn gdn_qkv mlp_up mlp_down
+```
+
+The cases intentionally cover different bottleneck regimes:
+
+| Case | Shape or state | Reason |
+|---|---:|---|
+| `gdn` | 32 × 128 × 128 FP32 state | recurrent update and state traffic |
+| `gdn_qkv` | K=8192, M=2560 | large GDN projection |
+| `gdn_gate` | K=32, M=2560 | launch/under-utilization boundary |
+| `gdn_out` | K=2560, M=4096 | GDN output projection |
+| `mlp_up` | K=9216, M=2560 | large expansion projection |
+| `mlp_down` | K=2560, M=9216 | wide reduction projection |
+| `lm_head` | K=248320, M=2560 | bandwidth-heavy vocabulary head |
+
+The default `detailed` set records Speed of Light, occupancy, compute workload,
+memory workload, and source counters. Override `NCU_SET` only for a focused
+follow-up; the `full` set is too expensive for routine before/after collection.
 
 If NCU reports `ERR_NVGPUCTRPERM` under WSL2, enable access on the Windows host:
 
