@@ -436,19 +436,26 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   std::shared_ptr<kernel::CudaConfig> cuda_config;
   std::shared_ptr<base::DeviceAllocator> output_alloc = cpu_alloc;
   void* cache_flush_buffer = nullptr;
-  size_t cache_flush_bytes = 0;
+  size_t cache_scratch_bytes = 0;
   if (device == base::DeviceType::kDeviceCUDA) {
     cuda_config = std::make_shared<kernel::CudaConfig>();
     check_cuda(cudaStreamCreate(&cuda_config->stream), "cudaStreamCreate");
     input.to_cuda(cuda_config->stream);
     weight.to_cuda(cuda_config->stream);
     output_alloc = base::CUDADeviceAllocatorFactory::get_instance();
-    if (options.cache == "cold") {
-      int32_t l2_bytes = 0;
-      check_cuda(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0),
-                 "query CUDA L2 cache size");
-      cache_flush_bytes = std::max<size_t>(static_cast<size_t>(l2_bytes) * 2, 1);
-      check_cuda(cudaMalloc(&cache_flush_buffer, cache_flush_bytes), "allocate cache flush buffer");
+    int32_t l2_bytes = 0;
+    check_cuda(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0),
+               "query CUDA L2 cache size");
+    cache_scratch_bytes = std::max<size_t>(static_cast<size_t>(l2_bytes) * 2, 1);
+    check_cuda(cudaMalloc(&cache_flush_buffer, cache_scratch_bytes),
+               "allocate cache flush buffer");
+    // Give both cache modes the same memory-heavy clock warmup. Without this,
+    // launch-bound K=32 kernels can appear slower in warm mode simply because
+    // the cold-cache memset raised the GPU clock first.
+    for (int32_t i = 0; i < 8; ++i) {
+      check_cuda(cudaMemsetAsync(cache_flush_buffer, i + 1, cache_scratch_bytes,
+                                 cuda_config->stream),
+                 "warm GPU clocks");
     }
     check_cuda(cudaStreamSynchronize(cuda_config->stream), "synchronize matmul setup");
   }
@@ -462,8 +469,7 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   const std::string range_name = "matmul/" + options.dtype + "/m" +
                                  std::to_string(options.input_size) + "_k" +
                                  std::to_string(options.output_size);
-  auto workload = [&] {
-    base::ScopedNvtxRange range(range_name.c_str());
+  auto launch = [&] {
     // MatmulLayer::forward() hides Layer's convenience overloads, so dispatch
     // through the base type just as the model's shared_ptr<Layer> plumbing does.
     op::Layer& base_layer = layer;
@@ -471,6 +477,10 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
     if (!status) {
       throw std::runtime_error("matmul failed: " + status.get_err_msg());
     }
+  };
+  auto workload = [&] {
+    base::ScopedNvtxRange range(range_name.c_str());
+    launch();
   };
 
   for (int32_t i = 0; i < options.warmup; ++i) {
@@ -482,15 +492,36 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
 
   std::vector<double> samples;
   samples.reserve(options.repeat);
-  for (int32_t i = 0; i < options.repeat; ++i) {
-    if (cache_flush_buffer) {
-      // Ordered before the start event on the same stream, so cache eviction is
-      // effective but excluded from the measured kernel duration.
-      check_cuda(cudaMemsetAsync(cache_flush_buffer, i + 1, cache_flush_bytes,
-                                 cuda_config->stream),
-                 "flush CUDA L2 cache");
+  if (device == base::DeviceType::kDeviceCUDA) {
+    std::vector<cudaEvent_t> starts(options.repeat, nullptr);
+    std::vector<cudaEvent_t> stops(options.repeat, nullptr);
+    for (int32_t i = 0; i < options.repeat; ++i) {
+      check_cuda(cudaEventCreate(&starts[i]), "create batched start event");
+      check_cuda(cudaEventCreate(&stops[i]), "create batched stop event");
     }
-    samples.push_back(measure_ms(device, cuda_config ? cuda_config->stream : nullptr, workload));
+    for (int32_t i = 0; i < options.repeat; ++i) {
+      if (options.cache == "cold") {
+        check_cuda(cudaMemsetAsync(cache_flush_buffer, i + 1, cache_scratch_bytes,
+                                   cuda_config->stream),
+                   "flush CUDA L2 cache");
+      }
+      check_cuda(cudaEventRecord(starts[i], cuda_config->stream), "record batched start event");
+      workload();
+      check_cuda(cudaEventRecord(stops[i], cuda_config->stream), "record batched stop event");
+    }
+    check_cuda(cudaEventSynchronize(stops.back()), "synchronize batched matmul measurements");
+    for (int32_t i = 0; i < options.repeat; ++i) {
+      float elapsed = 0.0f;
+      check_cuda(cudaEventElapsedTime(&elapsed, starts[i], stops[i]),
+                 "read batched matmul measurement");
+      samples.push_back(elapsed);
+      cudaEventDestroy(stops[i]);
+      cudaEventDestroy(starts[i]);
+    }
+  } else {
+    for (int32_t i = 0; i < options.repeat; ++i) {
+      samples.push_back(measure_cpu_ms(workload));
+    }
   }
 
   if (device == base::DeviceType::kDeviceCUDA) {
@@ -504,7 +535,7 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   if (cache_flush_buffer) {
     check_cuda(cudaFree(cache_flush_buffer), "free cache flush buffer");
   }
-  results.cache_flush_bytes = cache_flush_bytes;
+  results.cache_flush_bytes = options.cache == "cold" ? cache_scratch_bytes : 0;
   const double seconds = results.elapsed.median_ms / 1000.0;
   results.gflops = 2.0 * options.input_size * options.output_size / seconds / 1e9;
   const double bytes = static_cast<double>(options.input_size) * sizeof(float) +

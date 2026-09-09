@@ -37,8 +37,19 @@ device copies are outside the timed region.
 Matmul defaults to `--cache cold`: before each timed launch it touches a buffer
 twice the reported L2 size on the same stream, then records the start event.
 The flush is ordered before, but excluded from, the measurement. This models
-decode's stream through matrices much larger than L2. Use `--cache warm` as a
-separate best-case measurement; do not mix the two in a before/after table.
+decode's stream through matrices much larger than L2. `--cache warm` is kept as
+a diagnostic mode, but very short warm-cache kernels can be distorted by host
+submission and WSL/WDDM scheduling. It is not included in the primary baseline.
+
+Run every registered 4B shape in the primary cold-cache mode with:
+
+```bash
+benchmarks/qwen35/scripts/run_matmul_baseline.sh \
+  /tmp/qwen35-matmul-baseline 5 30
+```
+
+Set `CACHE_MODES="cold warm"` only when collecting an explicitly separate cache
+study.
 
 ## Model benchmark
 
