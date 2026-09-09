@@ -40,6 +40,7 @@ struct Options {
   std::string checkpoint;
   std::string tokenizer;
   std::string output;
+  std::string cache = "cold";
   int32_t input_size = 2560;
   int32_t output_size = 4096;
   int32_t prompt_length = 12;
@@ -104,6 +105,7 @@ std::string current_git_commit() {
       << "  --warmup N              Untimed workload repetitions (default: 1)\n"
       << "  --repeat N              Timed workload repetitions (default: 5)\n"
       << "  --output FILE           Also write the JSON result to FILE\n"
+      << "  --cache cold|warm       Matmul cache state (default: cold)\n"
       << "Model options:\n"
       << "  --prompt-length N       Deterministic synthetic prompt length (default: 12)\n"
       << "  --decode-steps N        Deterministic decode steps (default: 16)\n"
@@ -150,6 +152,8 @@ Options parse_options(int argc, char** argv) {
       options.tokenizer = value_after(i, arg);
     } else if (arg == "--output") {
       options.output = value_after(i, arg);
+    } else if (arg == "--cache") {
+      options.cache = value_after(i, arg);
     } else if (arg == "--m") {
       options.input_size = parse_positive(value_after(i, arg), arg);
     } else if (arg == "--k") {
@@ -176,6 +180,9 @@ Options parse_options(int argc, char** argv) {
   }
   if (options.dtype != "bf16" && options.dtype != "fp32") {
     throw std::runtime_error("--dtype must be bf16 or fp32");
+  }
+  if (options.cache != "cold" && options.cache != "warm") {
+    throw std::runtime_error("--cache must be cold or warm");
   }
   if (options.mode != "matmul" && (options.checkpoint.empty() || options.tokenizer.empty())) {
     throw std::runtime_error("model modes require --checkpoint and --tokenizer");
@@ -403,6 +410,7 @@ struct MatmulResults {
   double checksum = 0.0;
   double gflops = 0.0;
   double effective_gbps = 0.0;
+  size_t cache_flush_bytes = 0;
 };
 
 MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) {
@@ -427,12 +435,21 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
 
   std::shared_ptr<kernel::CudaConfig> cuda_config;
   std::shared_ptr<base::DeviceAllocator> output_alloc = cpu_alloc;
+  void* cache_flush_buffer = nullptr;
+  size_t cache_flush_bytes = 0;
   if (device == base::DeviceType::kDeviceCUDA) {
     cuda_config = std::make_shared<kernel::CudaConfig>();
     check_cuda(cudaStreamCreate(&cuda_config->stream), "cudaStreamCreate");
     input.to_cuda(cuda_config->stream);
     weight.to_cuda(cuda_config->stream);
     output_alloc = base::CUDADeviceAllocatorFactory::get_instance();
+    if (options.cache == "cold") {
+      int32_t l2_bytes = 0;
+      check_cuda(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0),
+                 "query CUDA L2 cache size");
+      cache_flush_bytes = std::max<size_t>(static_cast<size_t>(l2_bytes) * 2, 1);
+      check_cuda(cudaMalloc(&cache_flush_buffer, cache_flush_bytes), "allocate cache flush buffer");
+    }
     check_cuda(cudaStreamSynchronize(cuda_config->stream), "synchronize matmul setup");
   }
   tensor::Tensor output(base::DataType::kDataTypeFp32, options.output_size, true, output_alloc);
@@ -466,6 +483,13 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   std::vector<double> samples;
   samples.reserve(options.repeat);
   for (int32_t i = 0; i < options.repeat; ++i) {
+    if (cache_flush_buffer) {
+      // Ordered before the start event on the same stream, so cache eviction is
+      // effective but excluded from the measured kernel duration.
+      check_cuda(cudaMemsetAsync(cache_flush_buffer, i + 1, cache_flush_bytes,
+                                 cuda_config->stream),
+                 "flush CUDA L2 cache");
+    }
     samples.push_back(measure_ms(device, cuda_config ? cuda_config->stream : nullptr, workload));
   }
 
@@ -477,6 +501,10 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   for (int32_t i = 0; i < options.output_size; ++i) {
     results.checksum += output.index<float>(i);
   }
+  if (cache_flush_buffer) {
+    check_cuda(cudaFree(cache_flush_buffer), "free cache flush buffer");
+  }
+  results.cache_flush_bytes = cache_flush_bytes;
   const double seconds = results.elapsed.median_ms / 1000.0;
   results.gflops = 2.0 * options.input_size * options.output_size / seconds / 1e9;
   const double bytes = static_cast<double>(options.input_size) * sizeof(float) +
@@ -541,6 +569,8 @@ std::string result_json(const Options& options, const RuntimeInfo& runtime,
         << "    \"input_size_m\": " << options.input_size << ",\n"
         << "    \"output_size_k\": " << options.output_size << ",\n"
         << "    \"weight_dtype\": \"" << options.dtype << "\",\n"
+        << "    \"cache\": \"" << options.cache << "\",\n"
+        << "    \"cache_flush_bytes\": " << matmul->cache_flush_bytes << ",\n"
         << "    \"elapsed\": ";
     write_stats(out, matmul->elapsed, 4);
     out << ",\n"

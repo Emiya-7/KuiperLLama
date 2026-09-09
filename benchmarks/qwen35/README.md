@@ -30,9 +30,15 @@ device copies are outside the timed region.
 ```bash
 ./build/demo/qwen35_bench \
   --mode matmul --device cuda --dtype bf16 \
-  --m 2560 --k 4096 --warmup 5 --repeat 30 \
+  --m 2560 --k 4096 --cache cold --warmup 5 --repeat 30 \
   --output /tmp/qwen35-matmul-baseline.json
 ```
+
+Matmul defaults to `--cache cold`: before each timed launch it touches a buffer
+twice the reported L2 size on the same stream, then records the start event.
+The flush is ordered before, but excluded from, the measurement. This models
+decode's stream through matrices much larger than L2. Use `--cache warm` as a
+separate best-case measurement; do not mix the two in a before/after table.
 
 ## Model benchmark
 
@@ -92,7 +98,7 @@ benchmarks/qwen35/scripts/profile_ncu.sh \
   /tmp/qwen35-ncu/matmul-baseline 'qwen35@matmul/' -- \
   ./build/demo/qwen35_bench \
     --mode matmul --device cuda --dtype bf16 \
-    --m 2560 --k 4096 --warmup 5 --repeat 5
+    --m 2560 --k 4096 --cache cold --warmup 5 --repeat 5
 
 benchmarks/qwen35/scripts/profile_ncu.sh \
   /tmp/qwen35-ncu/decode-baseline 'qwen35@decode/' -- \
