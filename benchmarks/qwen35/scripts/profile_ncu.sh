@@ -50,6 +50,7 @@ if [[ ! -s "${OUTPUT_PREFIX}.ncu-rep" ]]; then
   exit 3
 fi
 
-sha256sum "${OUTPUT_PREFIX}.ncu-rep" >"${OUTPUT_PREFIX}.ncu-rep.sha256"
+REPORT_NAME="$(basename -- "${OUTPUT_PREFIX}.ncu-rep")"
+(cd -- "$OUTPUT_DIR" && sha256sum "$REPORT_NAME") >"${OUTPUT_PREFIX}.ncu-rep.sha256"
 ncu --import "${OUTPUT_PREFIX}.ncu-rep" --page raw --csv >"${OUTPUT_PREFIX}.raw.csv"
 echo "Wrote ${OUTPUT_PREFIX}.ncu-rep"
