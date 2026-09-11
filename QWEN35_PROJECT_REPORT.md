@@ -30,7 +30,7 @@
 - Qwen3.5-9B 的独立 `lm_head` 虽然已经实现导出/加载分支，但没有真实权重验证；
 - 9B BF16 文本权重约 18 GB，超过本机 12 GB 显存和 15 GB 物理内存，需要 INT8、
   分层卸载或更大设备；
-- 全量 53 项测试已在 RTX 4070 SUPER 上全部通过。
+- 全量 55 项测试已在 RTX 4070 SUPER 上全部通过。
 
 更细的架构推导、张量形状和公式见 [`QWEN35_STATUS.md`](QWEN35_STATUS.md)。本文重点
 记录从初始状态到现在完成了什么、实际验证到哪里、剩余问题和可直接执行的命令。
@@ -410,7 +410,7 @@ Transformers BF16 会在层间舍入激活，Kuiper 只以 BF16 保存大矩阵�
 - 最小 CUDA kernel 测试通过；
 - `Qwen35Tiny.CudaMatchesCpu` 独立通过；
 - 真实 8.413 GB Qwen3.5-4B checkpoint CUDA 加载和生成成功。
-- 完整 53 项测试全部通过。
+- 完整 55 项测试全部通过。
 
 4B CUDA 实测：
 
@@ -446,7 +446,7 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 
 | 对比 | decoder 最大相对误差 | final norm 相对误差 | logits 相对误差 | 10 tokens |
 |---|---:|---:|---:|---|
-| CUDA vs Kuiper CPU | `2.07594e-05` | `2.88499e-06` | `2.63144e-06` | 完全一致 |
+| 优化后 CUDA vs Kuiper CPU | `2.09229e-05` | `2.95896e-06` | `2.61240e-06` | 完全一致 |
 | CUDA vs Transformers BF16 | `1.86247e-02` | `8.05090e-03` | `1.32916e-02` | 完全一致 |
 
 前者远低于 Kuiper CPU/CUDA 对比阈值 `2e-3`；后者低于 BF16 reference 阈值
@@ -455,8 +455,8 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 
 ### 6.6 测试状态
 
-测试二进制当前包含 53 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
-`53/53 passed`，包括 `Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu`、
+测试二进制当前包含 55 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
+`55/55 passed`，包括 GDN 非零 state 16/128 步递推、`Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu`、
 `Qwen35Tiny.CudaMatchesCpu` 和真实 4B 投影尺寸的
 `test_matmul_bf16.qwen35_4b_projection_cuda_matches_cpu`。
 
@@ -470,7 +470,7 @@ safetensors、保持真实 248070 有效 ID 边界的确定性 tokenizer，并�
 checkpoint；`test_llm` 通过 `FIXTURES_REQUIRED` 自动获得模型和 tokenizer 路径。即使
 执行 `ctest -R '^test_llm$'`，CTest 也会自动补跑 setup。
 
-本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `53/53 passed`，fixture
+本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `55/55 passed`，fixture
 相关 tokenizer/CPU/CUDA 测试均实际执行，没有因环境变量缺失而 skip。
 
 `.github/workflows/qwen35-ci.yml` 在 `main`、`feat/**` push 和手动触发时，使用标签为

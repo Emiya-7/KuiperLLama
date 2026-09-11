@@ -378,6 +378,21 @@ R3 已经把每个线程的 K 循环从 128 缩短为 8，所以可以用 8 个�
 | `gdn-run2.ncu-rep` | `7b0758951df03a3947ffffd99abd972345bdfa5d387a1356a9da4c34b6e4625a` |
 | `gdn-run3.ncu-rep` | `fc8ff3a833e9303386ed7531150e03fe2fb6ccca2ef233bfe906f79b748c0b75` |
 
+### 9.7 真实 Qwen3.5-4B 模型级验证
+
+微基准和多步算子测试通过后，又使用提交 `6dc1c43`、现有 7.9 GiB BF16 checkpoint 分别生成完整 CUDA/CPU trace。输入为默认 12-token prompt，观测 32 层 decoder hidden、final norm、完整 248320 维 logits，并各自 greedy 生成 10 tokens。
+
+| 对比项 | 优化后 CUDA vs CPU |
+|---|---:|
+| Decoder hidden 最大相对误差 | `2.09229e-05`（layer 23） |
+| Final norm 相对误差 | `2.95896e-06` |
+| Logits 最大绝对误差 | `8.17776e-05` |
+| Logits 相对误差 | `2.61240e-06` |
+| 10 个 greedy tokens | 完全一致 |
+| 比较阈值 | `2e-3`，通过 |
+
+优化前 CUDA/CPU decoder 最大相对误差为 `2.07594e-05`，优化后仍为同一数量级，说明二维 reduction 带来的浮点结合顺序变化没有随 24 个 GDN 层和多 token 递推放大。trace 与完整比较输出保存在最终报告目录的 `model-validation/` 下。
+
 ## 10. 最终前后结果
 
 | 指标 | R0 Before | Final After | 变化 | 如何解释 |
@@ -393,7 +408,7 @@ R3 已经把每个线程的 K 循环从 128 缩短为 8，所以可以用 8 个�
 | Global load instructions | 49,664 | 36,352 | −26.8% | 单读 state 抵消 tiled 重复 load |
 | Registers/thread | 40 | 40 | 不变 | R3 降至 35，R4 用 5 个分配寄存器换流量 |
 | Local load/store | 0 / 0 | 0 / 0 | 无 spill | 寄存器方案通过硬门槛 |
-| CPU/CUDA correctness | 单步 max abs 0 | 1/16/128 步均通过 | 范围增强 | output 与完整 state 均验证 |
+| CPU/CUDA correctness | 单步 max abs 0 | 1/16/128 步及真实 4B trace 均通过 | 范围增强 | 4B decoder 最大相对误差 `2.09229e-05`，10 tokens 一致 |
 
 加速比统一写成：
 

@@ -8,16 +8,17 @@
 上与 Transformers FP32/eager 逐层对齐；Qwen3.5-4B 的真实 BF16 权重也已完成
 导出、Kuiper 端到端推理和 Transformers BF16 参考比较，覆盖了 4B 特有的 GDN
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
-8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 53 个 GTest；RTX 4070
+8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 55 个 GTest；RTX 4070
 SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测试结果为
-53/53 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
+55/55 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
 分别与 Kuiper CPU、Transformers BF16 对齐。详细结果见
 [`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 
 当前开发重点已调整为 4B 核心 CUDA 算子：使用 Nsight Compute 对 GDN 与 BF16
 GEMV/MatMul 做优化前后对照。9B 独立 `lm_head`、INT8 暂停，长 prompt 分块 prefill
-仍未实现。已完成的 NCU 优化前基线和瓶颈结论见
-[`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md)。
+仍未实现。GDN 已完成 512-block 二维 tile 和 state 单读优化，三次正式 NCU 为
+2.47–2.69×；完整过程见
+[`benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md)。
 
 ---
 
@@ -306,7 +307,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 53 个 GTest，已在 RTX 4070 SUPER 上全部通过，包括 Qwen3.5 tiny 的
+当前共定义 55 个 GTest，已在 RTX 4070 SUPER 上全部通过，包括 Qwen3.5 tiny 的
 CPU/CUDA 端到端对齐、Tensor BF16 存储/转换、BF16 matmul 和 BF16 embedding。
 
 ### 4.6 真实 Qwen3.5-0.8B 对 Transformers（阶段 3）
@@ -398,8 +399,8 @@ RTX 4070 SUPER（12,282 MiB，CUDA 12.8，sm_89）真机上，8.413 GB checkpoin
 
 `qwen35_trace` 已增加 `--device cpu|cuda`。CUDA 模式在模型自有 stream 上逐层复制
 并同步，真实 4B 保存了 32 层 decoder hidden、final norm、完整 logits 和 10 个生成
-token。CUDA vs Kuiper CPU 的 decoder 最大相对误差为 `2.07594e-05`、logits 为
-`2.63144e-06`；CUDA vs Transformers BF16 分别为 `1.86247e-02` 和
+token。GDN 优化后 CUDA vs Kuiper CPU 的 decoder 最大相对误差为 `2.09229e-05`、logits 为
+`2.61240e-06`；CUDA vs Transformers BF16 分别为 `1.86247e-02` 和
 `1.32916e-02`，两组比较的 10 个 token 均完全一致。CUDA trace 含加载总耗时
 7.29 秒，峰值主机 RSS `8,429,096 KB`。
 
@@ -407,7 +408,7 @@ token。CUDA vs Kuiper CPU 的 decoder 最大相对误差为 `2.07594e-05`、log
 分支都会在 launch 点立即检查 `cudaGetLastError()` 并报告 kernel 名称。另增加
 Qwen3.5-4B `in_proj_z [4096, 2560]` 真实尺寸的 BF16 CUDA matmul 专项测试，覆盖
 10,485,760 个权重，与 CPU 参考按 `2e-5` 相对阈值比较。RTX 4070 SUPER 上专项测试、
-全量 53 项测试和真实 4B CUDA trace 均通过。
+全量 55 项测试和真实 4B CUDA trace 均通过。
 
 ### 4.9 已发现并修复的实现错误
 
@@ -633,7 +634,7 @@ ctest --test-dir build --output-on-failure --timeout 300
 
 CTest 的 `qwen35_tiny_fixture` setup 会自动生成 safetensors、确定性 tokenizer 和 BF16
 checkpoint，再为 `test_llm` 设置路径；无需下载或复制真实 tokenizer。本机结果为 CTest
-`4/4 passed`（含 matmul/GDN benchmark smoke），内部 GTest `53/53 passed`，fixture
+`4/4 passed`（含 matmul/GDN benchmark smoke），内部 GTest `55/55 passed`，fixture
 相关测试没有 skip。GitHub Actions 使用
 `self-hosted, linux, x64, gpu` runner 执行同一套 configure/build/ctest 命令；为避免不受信任
 的代码直接运行在自托管机器上，workflow 只响应仓库 push 和手动触发。当前仓库尚未注册
