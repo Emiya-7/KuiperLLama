@@ -253,11 +253,100 @@ __global__ void gated_delta_step_kernel(const float* q, const float* k, const fl
   }
 }
 
+// Qwen3.5-4B uses 32 V heads with a [128, 128] state per head. An 8-column V
+// tile and 16-way K split raise the launch from 32 to 512 blocks. Each group
+// of eight neighboring threads accesses eight contiguous state columns; the
+// four groups in a warp touch independent K rows. Shared memory is used for
+// the cross-warp reductions, the resulting delta, and the reused K vector.
+constexpr int kGdn4BKHeadDim = 128;
+constexpr int kGdn4BVHeadDim = 128;
+constexpr int kGdnVTile = 8;
+constexpr int kGdnKLanes = 16;
+
+__global__ void gated_delta_step_kernel_4b_tiled(const float* q, const float* k, const float* v,
+                                                  const float* g, const float* beta, float* state,
+                                                  float* out, float q_scale) {
+  const int v_lane = threadIdx.x % kGdnVTile;
+  const int k_lane = threadIdx.x / kGdnVTile;
+  const int j = blockIdx.x * kGdnVTile + v_lane;
+  const int h = blockIdx.y;
+  const int kh = h / 2;
+
+  const float* q_h = q + static_cast<int64_t>(kh) * kGdn4BKHeadDim;
+  const float* k_h = k + static_cast<int64_t>(kh) * kGdn4BKHeadDim;
+  const float* v_h = v + static_cast<int64_t>(h) * kGdn4BVHeadDim;
+  float* S = state + static_cast<int64_t>(h) * kGdn4BKHeadDim * kGdn4BVHeadDim;
+  float* out_h = out + static_cast<int64_t>(h) * kGdn4BVHeadDim;
+
+  __shared__ float k_sh[kGdn4BKHeadDim];
+  __shared__ float partial[kGdnKLanes][kGdnVTile];
+  __shared__ float delta_sh[kGdnVTile];
+  __shared__ float head_scalars[2];
+  if (threadIdx.x < kGdn4BKHeadDim) {
+    k_sh[threadIdx.x] = k_h[threadIdx.x];
+  }
+  if (threadIdx.x == 0) {
+    head_scalars[0] = __expf(g[h]);
+    head_scalars[1] = beta[h];
+  }
+  __syncthreads();
+
+  const float decay = head_scalars[0];
+  float kv_partial = 0.f;
+#pragma unroll
+  for (int i = k_lane; i < kGdn4BKHeadDim; i += kGdnKLanes) {
+    kv_partial += k_sh[i] * S[static_cast<int64_t>(i) * kGdn4BVHeadDim + j] * decay;
+  }
+  partial[k_lane][v_lane] = kv_partial;
+  __syncthreads();
+
+  if (k_lane == 0) {
+    float kv_mem = partial[0][v_lane];
+#pragma unroll
+    for (int lane = 1; lane < kGdnKLanes; ++lane) {
+      kv_mem += partial[lane][v_lane];
+    }
+    delta_sh[v_lane] = (v_h[j] - kv_mem) * head_scalars[1];
+  }
+  __syncthreads();
+
+  const float delta = delta_sh[v_lane];
+  float out_partial = 0.f;
+#pragma unroll
+  for (int i = k_lane; i < kGdn4BKHeadDim; i += kGdnKLanes) {
+    const int64_t idx = static_cast<int64_t>(i) * kGdn4BVHeadDim + j;
+    const float s = S[idx] * decay + k_sh[i] * delta;
+    S[idx] = s;
+    out_partial += q_h[i] * q_scale * s;
+  }
+  partial[k_lane][v_lane] = out_partial;
+  __syncthreads();
+
+  if (k_lane == 0) {
+    float value = partial[0][v_lane];
+#pragma unroll
+    for (int lane = 1; lane < kGdnKLanes; ++lane) {
+      value += partial[lane][v_lane];
+    }
+    out_h[j] = value;
+  }
+}
+
 void gated_delta_step_cu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out, int32_t num_k_heads,
                          int32_t num_v_heads, int32_t k_head_dim, int32_t v_head_dim,
                          cudaStream_t stream) {
   const float q_scale = rsqrtf(static_cast<float>(k_head_dim));
+  if (num_k_heads == 16 && num_v_heads == 32 && k_head_dim == kGdn4BKHeadDim &&
+      v_head_dim == kGdn4BVHeadDim) {
+    constexpr dim3 block(kGdnVTile * kGdnKLanes);
+    constexpr dim3 grid(kGdn4BVHeadDim / kGdnVTile, 32);
+    gated_delta_step_kernel_4b_tiled<<<grid, block, 0, stream>>>(q, k, v, g, beta, state, out,
+                                                                q_scale);
+    check_cuda_kernel_launch("gated_delta_step_kernel_4b_tiled");
+    return;
+  }
+
   const size_t shmem = static_cast<size_t>(k_head_dim) * sizeof(float);
   gated_delta_step_kernel<kThreads><<<num_v_heads, kThreads, shmem, stream>>>(
       q, k, v, g, beta, state, out, num_k_heads, num_v_heads, k_head_dim, v_head_dim, q_scale);
