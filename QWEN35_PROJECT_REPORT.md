@@ -317,7 +317,10 @@ CPU BF16 matmul 同样是显式三重循环，没有走 Armadillo/BLAS 的矩阵
 
 #### Gated DeltaNet 性能
 
-- `gated_delta_step_cu` 对 state 做两趟扫描，可融合以减少一半左右的 state 访存。
+- 4B `gated_delta_step_cu` 已使用 `8 V columns x 16 K lanes` 的专用二维 tile，将 grid
+  从 32 增到 512 blocks；每线程把 8 个旧 state 值保存在寄存器中，从两次读取降为一次。
+- 三次正式 NCU duration 为 9.984–10.880 us，相对优化前 26.880 us 为
+  2.47–2.69×；local load/store 保持为 0。其他 shape 继续走 generic fallback。
 - prompt 阶段仍逐 token 递推，没有实现官方 chunk/parallel GDN prefill。
 - `causal_conv1d_decode` 每步移动 k-1 个历史值；k=4 时影响较小，但可换成环形缓冲。
 
@@ -664,8 +667,8 @@ ctest --test-dir build --output-on-failure --timeout 300
 
 1. **已完成**：GDN 和代表性 BF16 GEMV 的 NCU `detailed` 优化前基线，包括
    SchedulerStats、WarpStateStats、原始 CSV、报告哈希和未插桩 CUDA Event 延迟。
-2. 根据现有 NCU 的内存流量、occupancy、warp stall 和指令数据优化 GDN，再用完全相同的
-   输入和命令复测。
+2. **已完成**：根据 NCU 的 occupancy、warp stall 和指令数据优化 4B GDN；最终采用
+   512-block 二维 tile 和 state 寄存器复用，正式 NCU 为 2.47–2.69×。
 3. 优化 BF16 GEMV；按大投影、小输出投影和 `lm_head` 三种负载分别判断，避免只在
    单一形状上得出结论。
 4. 实现分块/并行 prefill。届时输入从单向量扩展到多 token 矩阵，建立真正的 GEMM

@@ -2,15 +2,15 @@
 
 本文是 Qwen3.5-4B `gated_delta_step` CUDA kernel 的独立优化档案，也是面试时讲解算子分析、实验设计与结果的主线材料。它不是一份只展示最终加速比的总结：基线、瓶颈证据、优化假设、失败方案、数值风险和每轮实测结果都会保留。
 
-当前状态：**R0/R1 已完成；R2 消冗余实验因退化被回退；R3 的 4B 二维 tiled kernel 已合入并完成重复 NCU 对照。** R4 的 state 单次读取仍待实验。文中标为“待测”的内容不能作为已经取得的结果对外陈述。
+当前状态：**阶段 2 的 GDN 核心优化已完成。** R2 消冗余实验因退化被回退；R3 用 4B 二维 tile 解决低并行度；R4 用寄存器复用把 state 两次读取降为一次。R4 三次 NCU duration 为 9.984–10.880 us，相对 R0 的 26.880 us 为 2.47–2.69×。周边算子融合留作独立的后续工作。
 
 ## 1. 面试讲解主线
 
 可以先用下面这段话概括项目，再按后续章节展开：
 
-> 我先为 Qwen3.5-4B 的 Gated DeltaNet recurrent step 建立了可复现的 CUDA Event 和 Nsight Compute 基线。原 kernel 数值正确，但每个 V head 只启动一个 block，整个 launch 只有 32 个 block；在 56 SM 的 RTX 4070 SUPER 上 achieved occupancy 只有 7.71%，94.63% 的 scheduler cycle 没有 eligible warp，long scoreboard 占 79.48%。同时 DRAM 和 SM 吞吐分别只有 25.15% 和 5.02%，所以它不是算力或显存带宽饱和，而是并行度不足时被 state load latency 卡住。我先试过缓存 q 和外提循环不变量：global load 减少 33.1%、总指令减少 21.3%，但延迟反而增加 13.0%，因此回退。随后采用 8-column × 16-K-lane 的二维 tile，把 grid 从 32 提升到 512 blocks；三次 NCU duration 为 12.960–13.344 us，相比 26.880 us 基线约为 2.01–2.07×，没有 local-memory spill。这个过程说明优化目标不是让指令数最少，而是让 GPU 有足够并行工作去隐藏 state latency。
+> 我先为 Qwen3.5-4B 的 Gated DeltaNet recurrent step 建立了可复现的 CUDA Event 和 Nsight Compute 基线。原 kernel 数值正确，但每个 V head 只启动一个 block，整个 launch 只有 32 个 block；在 56 SM 的 RTX 4070 SUPER 上 achieved occupancy 只有 7.71%，94.63% 的 scheduler cycle 没有 eligible warp，long scoreboard 占 79.48%。同时 DRAM 和 SM 吞吐分别只有 25.15% 和 5.02%，所以它不是算力或显存带宽饱和，而是并行度不足时被 state load latency 卡住。我先试过缓存 q 和外提循环不变量：global load 减少 33.1%、总指令减少 21.3%，但延迟反而增加 13.0%，因此回退。随后采用 8-column × 16-K-lane 的二维 tile，把 grid 从 32 提升到 512 blocks；最后让每个线程把 8 个旧 state 值保存在寄存器中，更新时不再二次读取。最终三次 NCU duration 为 9.984–10.880 us，相比 26.880 us 基线约为 2.47–2.69×，global load 减少 26.8%，并保持 0 local-memory spill。这个过程说明优化目标不是让指令数最少，而是先提供足够并行度隐藏延迟，再减少关键路径上的 state 请求。
 
-CUDA Event 对十几微秒 kernel 存在明显的 WSL/时钟离散值，因此本文同时给出历史冻结基线、同一时段 200 次 A/B 和重复 NCU，不从单次最小值推导加速比。R4 仍将继续测试 state 单次读取。
+CUDA Event 对十几微秒 kernel 存在明显的 WSL/时钟离散值，因此本文同时给出历史冻结基线、同一时段 200 次 A/B 和重复 NCU，不从单次最小值推导加速比。
 
 ## 2. 问题背景与算子语义
 
@@ -36,7 +36,7 @@ out     = q_scale * q^T * S'
 | state dtype | FP32 |
 | state 总大小 | `32 * 128 * 128 * 4 B = 2 MiB` |
 
-一次 recurrent step 会更新全部 32 个 state。按算法逻辑计，当前实现对 state 做两次读取和一次写回，流量约为 6 MiB；第二次读取可能命中 cache，所以该数值不能直接等同于 DRAM 实际流量。
+一次 recurrent step 会更新全部 32 个 state。按算法逻辑计，优化前实现对 state 做两次读取和一次写回，流量约为 6 MiB；第二次读取可能命中 cache，所以该数值不能直接等同于 DRAM 实际流量。R4 已将 4B specialization 改为一次读取和一次写回，generic fallback 仍维持原映射。
 
 ## 3. 优化前 kernel 如何工作
 
@@ -225,11 +225,11 @@ grid  = (4 V-column tiles, 32 heads) = 128 blocks
 - **寄存器暂存**：每个线程持有自己的 state 小片段，完成 `kv_mem` reduction 后直接用暂存值更新；
 - **shared state tile**：例如 `128 x 32` FP32 tile 需要 16 KiB/block，先读入、reduce，再更新并写回。
 
-预期：state logical traffic 从“两读一写”降为“一读一写”，global load 指令明显减少。寄存器版的硬门槛是 local load/store 仍为 0；shared 版需要观察 occupancy、bank conflict、barrier stall。任何因为 spill 或同步导致的延迟回退都应拒绝。
+最终采用寄存器方案。`8x16` tile 中每个线程恰好处理 8 个 K 元素，因此第一次扫描时把 8 个旧 state 值保存在标量化的局部数组里，跨两次 block reduction 存活；更新阶段直接使用这些寄存器值。global load 从 R3 的 52,736 降到 36,352，正好减少 16,384 条，registers/thread 从 35 增到 40，local load/store 仍为 0。三次 NCU duration 为 9.984–10.880 us，因此接受。
 
 ### 阶段 E：4B shape specialization
 
-若通用 kernel 的动态维度、除法或边界分支仍有可见成本，为 `nk=16, nv=32, kd=128, vd=128, v_per_k=2` 增加模板 specialization，并保留 generic fallback，不能破坏 Qwen3.5-0.8B/2B 等其他配置。
+R3/R4 已为 `nk=16, nv=32, kd=128, vd=128, v_per_k=2` 增加专用 dispatch，并保留原 generic kernel。通用 grouped-shape 16 步测试继续走 fallback，4B 实际 shape 128 步测试走 specialization，因此专用优化不会破坏 Qwen3.5-0.8B/2B 等其他配置。
 
 ### 阶段 F：GDN 周边融合
 
@@ -242,11 +242,11 @@ grid  = (4 V-column tiles, 32 heads) = 128 blocks
 | 轮次 | Commit | 主要变化 | Event median | Event p95 | NCU duration | Achieved occupancy | Eligible | Long scoreboard | Registers | Local ld/st | 结论 |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | R0 | `304eea3` | 原始一列一线程、state 两趟扫描 | 16.384 us | 24.256 us | 26.880 us | 7.71% | 5.37% | 79.48% | 40 | 0 / 0 | 优化前基线 |
-| R1 | `test(qwen35): strengthen recurrent GDN coverage` | 非零 state、多步正确性护栏 | 不变 | 不变 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 已完成；55/55 GTest、4/4 CTest |
+| R1 | `5925f79` | 非零 state、多步正确性护栏 | 不变 | 不变 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 已完成；55/55 GTest、4/4 CTest |
 | R2 | 未提交，已回退 | 标量/q cache 与循环不变量外提 | 26.624 us | 28.672 us | 28.384 us | 8.43% | 4.00% | 78.73% | 40 | 0 / 0 | 退化 13.0%，拒绝 |
 | R3 | `89224fe` | 4B `8x16` 二维 K/V tile | 16.848–17.408 us | 23.552–26.624 us | 12.960–13.344 us | 53.77–57.39% | 11.80–12.00% | 73.12–77.53% | 35 | 0 / 0 | 接受；NCU 约 2.01–2.07× |
-| R4 | 待提交 | state 单次读取 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
-| R5 | 待提交 | shape specialization / 周边融合 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
+| R4 | `6dc1c43` | 8 个旧 state 值寄存器复用 | 10.912–16.304 us | 22.528–32.480 us | 9.984–10.880 us | 53.50–75.06% | 9.14–11.70% | 36.95–38.75% | 40 | 0 / 0 | 接受；最终 NCU 约 2.47–2.69× |
+| R5 | R3/R4 已含 4B dispatch | shape specialization | 同 R4 | 同 R4 | 同 R4 | 同 R4 | 同 R4 | 同 R4 | 同 R4 | 同 R4 | generic fallback 保留；周边融合延期 |
 
 ### 9.2 单轮记录模板
 
@@ -342,22 +342,58 @@ R2 将 q、k 和 head scalar 放入 shared memory，并把 decay、q_scale 移�
 | `gdn-run2.ncu-rep` | `419c533e7518d372aff41df804b3746a4628596df4a7a3a750b05a593e63f8b7` |
 | `gdn-run3.ncu-rep` | `ae56e266eee43c310151855daef39ca202d552520b9d8a03abe24376c13c1c19` |
 
-## 10. 前后结果表（优化完成后填写）
+### 9.6 R4：寄存器复用实现 state 单次读取
+
+R3 已经把每个线程的 K 循环从 128 缩短为 8，所以可以用 8 个寄存器保存第一次 dot-product 阶段加载的旧 state。它们跨 `kv_mem` 和 `delta` reduction 存活，第二阶段直接计算更新值并写回，无需再次读取 global state。
+
+选择 `gdn-run1` 作为三次正式报告的中位 duration 代表：
+
+| 指标 | R0 | R3 `gdn-run2` | R4 `gdn-run1` | R4 相对 R3 |
+|---|---:|---:|---:|---:|
+| NCU duration | 26.880 us | 13.152 us | 10.784 us | −18.0%，1.22× |
+| Global load instructions | 49,664 | 52,736 | 36,352 | −31.1% |
+| Global store instructions | 16,512 | 16,896 | 16,896 | 不变 |
+| Total instructions | 310,016 | 466,944 | 350,208 | −25.0% |
+| Registers/thread | 40 | 35 | 40 | +5 |
+| Local load/store | 0 / 0 | 0 / 0 | 0 / 0 | 无 spill |
+| Achieved occupancy | 7.71% | 57.39% | 53.50% | −3.89 pp，仍远高于 R0 |
+| Long scoreboard | 79.48% | 73.12% | 38.62% | −34.50 pp |
+| DRAM bandwidth | 123.41 GB/s | 350.94 GB/s | 387.94 GB/s | +10.5% |
+
+三次正式 NCU duration 为 10.784、10.880、9.984 us，对 R0 分别为 2.49×、2.47×、2.69×。Event 的三组 5/30 median 为 16.208、16.304、10.912 us，离散仍然明显；更稳定的 20/200 组为 median 16.144 us、p95 17.408 us。相对同一工作阶段采集的 R0 20/200 数据 23.552/24.576 us，median 为 1.46×、p95 为 1.41×。
+
+最终报告目录：
+
+```text
+/home/tuesday/workspace/icd/profiles/KuiperLLama/qwen35/4b-stage2-gdn-final-6dc1c43/
+├── cuda-events/
+└── ncu/
+```
+
+报告 SHA-256：
+
+| 报告 | SHA-256 |
+|---|---|
+| `gdn-run1.ncu-rep` | `f210c5a2de9f1a0605c2d3d00667529094ed2f8aa439033e7d81b37c29e9e4c8` |
+| `gdn-run2.ncu-rep` | `7b0758951df03a3947ffffd99abd972345bdfa5d387a1356a9da4c34b6e4625a` |
+| `gdn-run3.ncu-rep` | `fc8ff3a833e9303386ed7531150e03fe2fb6ccca2ef233bfe906f79b748c0b75` |
+
+## 10. 最终前后结果
 
 | 指标 | R0 Before | Final After | 变化 | 如何解释 |
 |---|---:|---:|---:|---|
-| CUDA Event median | 16.384 us | 待测 | 待测 | 最终主要性能结论 |
-| CUDA Event p95 | 24.256 us | 待测 | 待测 | 稳定性，不隐藏长尾 |
-| NCU duration | 26.880 us | 待测 | 待测 | 插桩环境中的同口径对照 |
-| Grid blocks | 32 | 待测 | 待测 | 是否增加真实并行度 |
-| Achieved occupancy | 7.71% | 待测 | 待测 | 是否有更多 active warp |
-| One or more eligible | 5.37% | 待测 | 待测 | scheduler 是否更常有指令可发射 |
-| No eligible | 94.63% | 待测 | 待测 | 延迟隐藏是否改善 |
-| Long scoreboard | 79.48% | 待测 | 待测 | memory dependency 是否缓解 |
-| Global load instructions | 49,664 | 待测 | 待测 | q cache/state 单读是否生效 |
-| Registers/thread | 40 | 待测 | 待测 | 资源代价 |
-| Local load/store | 0 / 0 | 待测 | 待测 | 必须避免 spill |
-| CPU/CUDA error | max abs 0 | 待测 | 待测 | 数值正确性 |
+| CUDA Event median（同阶段 20/200） | 23.552 us | 16.144 us | −31.5%，1.46× | 短 kernel 仍有离散值，结合 NCU 判断 |
+| CUDA Event p95（同阶段 20/200） | 24.576 us | 17.408 us | −29.2%，1.41× | p95 同时改善 |
+| NCU duration（代表报告） | 26.880 us | 10.784 us | −59.9%，2.49× | 插桩环境同配置对照 |
+| Grid blocks | 32 | 512 | 16× | 提供足够独立工作 |
+| Waves/SM | 0.05 | 0.76 | 15.2× | launch 覆盖能力提高 |
+| Achieved occupancy | 7.71% | 53.50% | +45.79 pp | 更多 active warp 隐藏延迟 |
+| Eligible issue | 5.37% | 11.70% | +6.33 pp | scheduler 更常能发射指令 |
+| Long scoreboard | 79.48% | 38.62% | −40.86 pp | state memory dependency 明显缓解 |
+| Global load instructions | 49,664 | 36,352 | −26.8% | 单读 state 抵消 tiled 重复 load |
+| Registers/thread | 40 | 40 | 不变 | R3 降至 35，R4 用 5 个分配寄存器换流量 |
+| Local load/store | 0 / 0 | 0 / 0 | 无 spill | 寄存器方案通过硬门槛 |
+| CPU/CUDA correctness | 单步 max abs 0 | 1/16/128 步均通过 | 范围增强 | output 与完整 state 均验证 |
 
 加速比统一写成：
 
