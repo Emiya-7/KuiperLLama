@@ -675,6 +675,8 @@ ctest --test-dir build --output-on-failure --timeout 300
 调度优化。9B、INT8 与 9B 独立 `lm_head` 真实权重验证因内存空间不足暂缓，不纳入当前
 里程碑。当前基线数据、采集命令和严格的前后对照规则见
 [`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md)。
+GDN 的独立面试讲解、瓶颈证据、分轮实验和最终前后结果持续记录在
+[`benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md)。
 
 建议继续遵守“一项完整功能一个 commit”的规则：实现、测试、文档属于同一功能时放入
 同一个 commit；互不依赖的修复和优化分别提交。
@@ -699,5 +701,6 @@ ctest --test-dir build --output-on-failure --timeout 300
 | [`demo/main_qwen35.cpp`](demo/main_qwen35.cpp) | Qwen3.5 CUDA/CPU 推理 demo |
 | [`tools/verify_qwen35/`](tools/verify_qwen35/) | Kuiper/HF trace 和比较工具 |
 | [`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md) | 4B 核心算子性能基线与 NCU 对照规则 |
+| [`benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md) | GDN 面试讲解、优化实验与前后结果档案 |
 | [`kuiper/source/model/qwen35.cpp`](kuiper/source/model/qwen35.cpp) | 模型加载、buffer、forward、状态管理 |
 | [`kuiper/source/op/kernels/cuda/qwen35_kernel.cu`](kuiper/source/op/kernels/cuda/qwen35_kernel.cu) | Qwen3.5 CUDA kernel |

@@ -1,5 +1,9 @@
 # Qwen3.5 CUDA performance baseline
 
+GDN 的面试向瓶颈分析、逐轮优化计划和后续实测记录见
+[`GDN_OPTIMIZATION_PROCESS.md`](GDN_OPTIMIZATION_PROCESS.md)。该文档会随每次 GDN
+优化同步更新，并明确区分已测结果与待验证假设。
+
 `qwen35_bench` is the reproducible timing harness used before and after CUDA
 kernel optimizations. It deliberately does not use `qwen35_trace`: trace mode
 synchronizes and copies every selected hidden state, which changes the workload.
