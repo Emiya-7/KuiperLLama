@@ -143,6 +143,8 @@ The curated 4B suite can run all cases or selected cases:
 benchmarks/qwen35/scripts/run_ncu_operator_baseline.sh /tmp/qwen35-ncu-baseline
 benchmarks/qwen35/scripts/run_ncu_operator_baseline.sh \
   /tmp/qwen35-ncu-baseline gdn gdn_qkv mlp_up mlp_down
+
+benchmarks/qwen35/scripts/summarize_ncu.py /tmp/qwen35-ncu-baseline
 ```
 
 The cases intentionally cover different bottleneck regimes:
