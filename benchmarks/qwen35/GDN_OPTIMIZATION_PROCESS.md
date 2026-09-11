@@ -2,15 +2,15 @@
 
 本文是 Qwen3.5-4B `gated_delta_step` CUDA kernel 的独立优化档案，也是面试时讲解算子分析、实验设计与结果的主线材料。它不是一份只展示最终加速比的总结：基线、瓶颈证据、优化假设、失败方案、数值风险和每轮实测结果都会保留。
 
-当前状态：**R0 优化前基线和 R1 正确性护栏已经完成，尚未修改 GDN kernel。** 文中标为“待测”的内容是后续实验计划，不能作为已经取得的结果对外陈述。
+当前状态：**R0/R1 已完成；R2 消冗余实验因退化被回退；R3 的 4B 二维 tiled kernel 已合入并完成重复 NCU 对照。** R4 的 state 单次读取仍待实验。文中标为“待测”的内容不能作为已经取得的结果对外陈述。
 
 ## 1. 面试讲解主线
 
 可以先用下面这段话概括项目，再按后续章节展开：
 
-> 我先为 Qwen3.5-4B 的 Gated DeltaNet recurrent step 建立了可复现的 CUDA Event 和 Nsight Compute 基线。原 kernel 数值正确，但每个 V head 只启动一个 block，整个 launch 只有 32 个 block；在 56 SM 的 RTX 4070 SUPER 上 achieved occupancy 只有 7.71%，94.63% 的 scheduler cycle 没有 eligible warp，long scoreboard 占 79.48%。同时 DRAM 和 SM 吞吐分别只有 25.15% 和 5.02%，所以它不是算力或显存带宽饱和，而是并行度不足时被 state load latency 卡住。后续优化会先消除重复标量计算和 q 读取，再通过二维 K/V tile 增加真实并行度，最后尝试把 state 的两次读取降为一次。每一步都用相同输入做 CPU/CUDA 正确性、CUDA Event 延迟和 NCU counter 对照，只保留有稳定收益且没有 spill 的方案。
+> 我先为 Qwen3.5-4B 的 Gated DeltaNet recurrent step 建立了可复现的 CUDA Event 和 Nsight Compute 基线。原 kernel 数值正确，但每个 V head 只启动一个 block，整个 launch 只有 32 个 block；在 56 SM 的 RTX 4070 SUPER 上 achieved occupancy 只有 7.71%，94.63% 的 scheduler cycle 没有 eligible warp，long scoreboard 占 79.48%。同时 DRAM 和 SM 吞吐分别只有 25.15% 和 5.02%，所以它不是算力或显存带宽饱和，而是并行度不足时被 state load latency 卡住。我先试过缓存 q 和外提循环不变量：global load 减少 33.1%、总指令减少 21.3%，但延迟反而增加 13.0%，因此回退。随后采用 8-column × 16-K-lane 的二维 tile，把 grid 从 32 提升到 512 blocks；三次 NCU duration 为 12.960–13.344 us，相比 26.880 us 基线约为 2.01–2.07×，没有 local-memory spill。这个过程说明优化目标不是让指令数最少，而是让 GPU 有足够并行工作去隐藏 state latency。
 
-最后一句中的“后续优化”目前是计划。完成实验后，应把它改写为实际采用的方案、加速比与取舍。
+CUDA Event 对十几微秒 kernel 存在明显的 WSL/时钟离散值，因此本文同时给出历史冻结基线、同一时段 200 次 A/B 和重复 NCU，不从单次最小值推导加速比。R4 仍将继续测试 state 单次读取。
 
 ## 2. 问题背景与算子语义
 
@@ -203,20 +203,20 @@ GDN step 是带 recurrent state 原位更新的 rank-1 递推，不是规则的�
 3. 将第一次循环改成 `kv_raw += k * S`，循环外再乘一次 `decay`；
 4. 将固定的 `q_scale` 移出内层，或预先进入 `q_scaled`。
 
-预期：global load 指令和特殊函数/乘法指令下降，NCU duration 与 Event median 小幅改善。风险是浮点运算重结合改变末位误差，因此需要采用既定 tolerance，并报告误差而不是只报 pass/fail。
+实验结果：global load 从 49,664 降到 33,216（−33.1%），总指令从 310,016 降到 244,096（−21.3%），说明代码改动达到了“消除冗余”的局部目标。但 shared load 增到 24,832，long-scoreboard 等待由 15.05 增至 20.41 cycles/issue，NCU duration 由 26.880 增至 28.384 us。同一时段 200 次 Event median 由原 kernel 的 23.552 增至 26.624 us（慢 13.0%）。因此 R2 被回退：减少指令不等于缩短关键路径，原 q broadcast 经过 cache 后的代价低于新增 shared dependency。
 
 ### 阶段 C：二维 K/V tile，提高真实并行度
 
-首选原型为：
+初始原型为：
 
 ```text
 block = (32 V columns, 4 K lanes) = 128 threads
 grid  = (4 V-column tiles, 32 heads) = 128 blocks
 ```
 
-每个线程只遍历 32 个 K 元素；同一 warp 固定 K lane、覆盖连续 V columns，继续保证 state load/store 合并。K lanes 之间用 shared memory 做确定性 reduction，避免 atomic。还会比较 `64x2`、`32x4`、`16x8` 三种 tile。
+实际比较了 `64x2`、`32x4`、`16x8`、`8x16` 和 `4x32`。最终选择 `8x16`：每个 block 仍为 128 threads，每个线程只处理 8 个 K 元素，grid 为 `16 V tiles * 32 heads = 512 blocks`。每组 8 个相邻线程访问连续 state columns，K lanes 之间用 shared memory 做确定性 reduction，不使用 atomic。
 
-预期：grid 从 32 增大到 128，Waves/SM、achieved occupancy、active/eligible warps 上升；`No eligible`、long scoreboard 占比和单线程依赖链下降。代价是 reduction、同步与 shared memory 流量，因此不能仅凭 occupancy 上升判定成功。
+结果符合“增加可调度工作”的核心假设。代表性 NCU 报告中 Waves/SM 从 0.05 增至 0.76，achieved occupancy 从 7.71% 增至 57.39%，eligible warps/scheduler 从 0.054 增至 0.171，DRAM 吞吐从 123.41 增至 350.94 GB/s。虽然 reduction 和每个 tile 重复加载使总指令与 global load 增加，绝对 duration 仍下降约一半，证明基线的首要问题确实是并行度而不是指令数量。
 
 ### 阶段 D：把 state 两次读取降为一次
 
@@ -243,8 +243,8 @@ grid  = (4 V-column tiles, 32 heads) = 128 blocks
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | R0 | `304eea3` | 原始一列一线程、state 两趟扫描 | 16.384 us | 24.256 us | 26.880 us | 7.71% | 5.37% | 79.48% | 40 | 0 / 0 | 优化前基线 |
 | R1 | `test(qwen35): strengthen recurrent GDN coverage` | 非零 state、多步正确性护栏 | 不变 | 不变 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 已完成；55/55 GTest、4/4 CTest |
-| R2 | 待提交 | 标量/q cache 与循环不变量外提 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
-| R3 | 待提交 | 二维 K/V tile | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
+| R2 | 未提交，已回退 | 标量/q cache 与循环不变量外提 | 26.624 us | 28.672 us | 28.384 us | 8.43% | 4.00% | 78.73% | 40 | 0 / 0 | 退化 13.0%，拒绝 |
+| R3 | `89224fe` | 4B `8x16` 二维 K/V tile | 16.848–17.408 us | 23.552–26.624 us | 12.960–13.344 us | 53.77–57.39% | 11.80–12.00% | 73.12–77.53% | 35 | 0 / 0 | 接受；NCU 约 2.01–2.07× |
 | R4 | 待提交 | state 单次读取 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
 | R5 | 待提交 | shape specialization / 周边融合 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
 
@@ -278,6 +278,69 @@ R1 没有修改 kernel，也没有声称取得性能收益。新增测试直接�
 - focused GDN 测试 3/3 通过，完整 GTest 55/55、CTest 4/4 通过。
 
 这一轮补上了原 benchmark “零 state、单步”无法覆盖的递推风险。后续循环重排即使第一步看似正确，只要误差随 state 累积或 state 原位更新发生错误，16/128 步检查都能暴露问题。
+
+### 9.4 R2：减少了指令，但 kernel 更慢
+
+R2 将 q、k 和 head scalar 放入 shared memory，并把 decay、q_scale 移出内层循环。结果是一个很有价值的反例：
+
+| 指标 | R0 | R2 | 变化 |
+|---|---:|---:|---:|
+| Global load instructions | 49,664 | 33,216 | −33.1% |
+| Total instructions | 310,016 | 244,096 | −21.3% |
+| Shared load instructions | 8,192 | 24,832 | +203.1% |
+| Long scoreboard cycles/issue | 15.05 | 20.41 | +35.6% |
+| NCU duration | 26.880 us | 28.384 us | +5.6% |
+| 同时段 Event median（200 samples） | 23.552 us | 26.624 us | +13.0% |
+
+结论是原 q global broadcast 的 cache 行为已经较好；替换成 shared load 后新增的依赖和 shared 指令反而拉长关键路径。该版本源码已回退，报告和同一时段 A/B JSON 保存在 `/home/tuesday/workspace/icd/profiles/KuiperLLama/qwen35/4b-stage2-gdn-rejected-r2-5925f79/`。
+
+### 9.5 R3：二维 tile 解决低并行度
+
+所有候选均使用 128 threads/block。Event 探索采用 20 warmup、200 samples：
+
+| V tile × K lanes | Grid blocks | Median | p95 | 判断 |
+|---|---:|---:|---:|---|
+| R0 原 kernel | 32 | 23.552 us | 24.576 us | 同一时段对照 |
+| `64x2` | 64 | 29.056 us | 30.720 us | block 仍不足，拒绝 |
+| `32x4` | 128 | 19.472 us | 20.544 us | 有收益 |
+| `16x8` | 256 | 17.408 us | 22.496 us | 继续改善 |
+| `8x16` | 512 | 17.408 us | 19.456 us | p95 更好，NCU 最优，接受 |
+| `4x32` | 1024 | 20.144 us | 29.344 us | reduction/重复工作超过收益，拒绝 |
+
+`8x16` 相对同时段 R0 的 Event median 为 `23.552 / 17.408 = 1.35x`，延迟下降 26.1%。正式提交后的三组 5/30 median 为 17.408、16.848、17.408 us；历史 R0 单组为 16.384 us，因此不能声称短 Event 的跨时段结果稳定优于历史基线。200-sample 稳定性组 median/p95 为 17.408/19.072 us。
+
+三份提交后 NCU 报告的 duration 为 13.344、13.152、12.960 us；相比 R0 的 26.880 us 为 2.01–2.07×。首份报告的 derived long-scoreboard 百分比为异常的 108.25%，原始报告仍保留，但该派生项不用于结论；另外两份为 73.12% 和 77.53%。选择中间一份 `gdn-run2` 展示其余 counter：
+
+| 指标 | R0 | R3 `gdn-run2` | 变化 |
+|---|---:|---:|---:|
+| NCU duration | 26.880 us | 13.152 us | −51.1%，2.04× |
+| Grid blocks | 32 | 512 | 16× |
+| Waves/SM | 0.05 | 0.76 | 15.2× |
+| Achieved occupancy | 7.71% | 57.39% | +49.68 pp |
+| Eligible warps/scheduler | 0.054 | 0.171 | 3.18× |
+| DRAM bandwidth | 123.41 GB/s | 350.94 GB/s | 2.84× |
+| Global load instructions | 49,664 | 52,736 | +6.2% |
+| Total instructions | 310,016 | 466,944 | +50.6% |
+| Registers/thread | 40 | 35 | −5 |
+| Local load/store | 0 / 0 | 0 / 0 | 无 spill |
+
+这里最重要的结论是：R3 做了更多 reduction/shared 指令，却用更短时间完成，因为更多 block 和更短的单线程 K 链让 GPU 能并发发出更多 state memory request。优化的是可执行并行度和延迟隐藏，不是静态指令数。
+
+正式报告目录：
+
+```text
+/home/tuesday/workspace/icd/profiles/KuiperLLama/qwen35/4b-stage2-gdn-after-89224fe/
+├── cuda-events/
+└── ncu/
+```
+
+报告 SHA-256：
+
+| 报告 | SHA-256 |
+|---|---|
+| `gdn.ncu-rep` | `d78ef53e8175c0ce23069fa7e6e0a12cee7ed26b2aad25a6db4032fc886b8c07` |
+| `gdn-run2.ncu-rep` | `419c533e7518d372aff41df804b3746a4628596df4a7a3a750b05a593e63f8b7` |
+| `gdn-run3.ncu-rep` | `ae56e266eee43c310151855daef39ca202d552520b9d8a03abe24376c13c1c19` |
 
 ## 10. 前后结果表（优化完成后填写）
 
