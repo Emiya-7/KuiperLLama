@@ -292,10 +292,15 @@ __global__ void gated_delta_step_kernel_4b_tiled(const float* q, const float* k,
   __syncthreads();
 
   const float decay = head_scalars[0];
+  constexpr int kStateValuesPerThread = kGdn4BKHeadDim / kGdnKLanes;
+  float state_values[kStateValuesPerThread];
   float kv_partial = 0.f;
 #pragma unroll
-  for (int i = k_lane; i < kGdn4BKHeadDim; i += kGdnKLanes) {
-    kv_partial += k_sh[i] * S[static_cast<int64_t>(i) * kGdn4BVHeadDim + j] * decay;
+  for (int item = 0; item < kStateValuesPerThread; ++item) {
+    const int i = k_lane + item * kGdnKLanes;
+    const float state_value = S[static_cast<int64_t>(i) * kGdn4BVHeadDim + j];
+    state_values[item] = state_value;
+    kv_partial += k_sh[i] * state_value * decay;
   }
   partial[k_lane][v_lane] = kv_partial;
   __syncthreads();
@@ -313,9 +318,10 @@ __global__ void gated_delta_step_kernel_4b_tiled(const float* q, const float* k,
   const float delta = delta_sh[v_lane];
   float out_partial = 0.f;
 #pragma unroll
-  for (int i = k_lane; i < kGdn4BKHeadDim; i += kGdnKLanes) {
+  for (int item = 0; item < kStateValuesPerThread; ++item) {
+    const int i = k_lane + item * kGdnKLanes;
     const int64_t idx = static_cast<int64_t>(i) * kGdn4BVHeadDim + j;
-    const float s = S[idx] * decay + k_sh[i] * delta;
+    const float s = state_values[item] * decay + k_sh[i] * delta;
     S[idx] = s;
     out_partial += q_h[i] * q_scale * s;
   }
