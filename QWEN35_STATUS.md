@@ -16,7 +16,7 @@ SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测�
 
 当前开发重点已调整为 4B 核心 CUDA 算子：使用 Nsight Compute 对 GDN 与 BF16
 GEMV/MatMul 做优化前后对照。9B 独立 `lm_head`、INT8 暂停，长 prompt 分块 prefill
-仍未实现。性能基线与 NCU 权限状态见
+仍未实现。已完成的 NCU 优化前基线和瓶颈结论见
 [`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md)。
 
 ---

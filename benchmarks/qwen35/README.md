@@ -112,9 +112,9 @@ ncu --list-sections
 ```
 
 On the current RTX 4070 SUPER workstation this resolves to Nsight Compute
-2025.1.1 (`ncu` and `ncu-ui`). The CLI and section discovery work, but the first
-counter collection returned `ERR_NVGPUCTRPERM`; the Windows-host permission
-step below must be completed before baseline reports can be collected.
+2025.1.1 (`ncu` and `ncu-ui`). The initial collection returned
+`ERR_NVGPUCTRPERM`; Windows-host permission has since been enabled and the
+2026-09-11 operator baseline was collected successfully.
 
 The profiling helper filters by CUDA kernel function, profiles one matching
 launch, captures the environment, exports the `.ncu-rep`, writes a SHA-256, and

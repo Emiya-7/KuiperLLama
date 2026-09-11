@@ -508,11 +508,11 @@ pull request 代码直接落到自托管机器执行。
 
 ### P1：当前 4B 算子优化
 
-1. Windows 驱动尚未开放 GPU performance counter，NCU `detailed` 基线被
-   `ERR_NVGPUCTRPERM` 阻塞。
-2. BF16 CUDA 单 token 投影仍是自研 GEMV，未使用 Tensor Core/cuBLASLt。
-3. GDN state 更新需要依据 NCU 数据确认内存带宽、occupancy 和 stall 瓶颈后再优化。
-4. prompt 仍逐 token 串行；分块 prefill 及真正的多行 GEMM 未实现。
+1. GDN 的 NCU 基线显示只有 32 blocks、7.71% achieved occupancy，且 79.48% 的
+   warp issue 间隔来自 long scoreboard；需要优先增加并行度并减少状态依赖等待。
+2. BF16 CUDA 单 token 投影仍是自研 GEMV，代表性大投影已达到 90.18-93.95% DRAM
+   throughput，但没有 Tensor Core 指令。
+3. prompt 仍逐 token 串行；分块 prefill 及真正的多行 GEMM 未实现。
 
 ### P2：性能和工程质量
 
@@ -662,9 +662,9 @@ ctest --test-dir build --output-on-failure --timeout 300
 
 ## 10. 当前算子优化顺序
 
-1. 开启 Windows NVIDIA GPU performance counter 权限，完成 GDN 和代表性 BF16
-   GEMV 的 NCU `detailed` 基线。
-2. 根据 NCU 的内存流量、occupancy、warp stall 和指令数据优化 GDN，再用完全相同的
+1. **已完成**：GDN 和代表性 BF16 GEMV 的 NCU `detailed` 优化前基线，包括
+   SchedulerStats、WarpStateStats、原始 CSV、报告哈希和未插桩 CUDA Event 延迟。
+2. 根据现有 NCU 的内存流量、occupancy、warp stall 和指令数据优化 GDN，再用完全相同的
    输入和命令复测。
 3. 优化 BF16 GEMV；按大投影、小输出投影和 `lm_head` 三种负载分别判断，避免只在
    单一形状上得出结论。
