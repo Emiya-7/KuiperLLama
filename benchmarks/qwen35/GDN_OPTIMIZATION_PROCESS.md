@@ -2,7 +2,7 @@
 
 本文是 Qwen3.5-4B `gated_delta_step` CUDA kernel 的独立优化档案，也是面试时讲解算子分析、实验设计与结果的主线材料。它不是一份只展示最终加速比的总结：基线、瓶颈证据、优化假设、失败方案、数值风险和每轮实测结果都会保留。
 
-当前状态：**已完成优化前基线和瓶颈分析，尚未修改 GDN kernel。** 文中标为“待测”的内容是后续实验计划，不能作为已经取得的结果对外陈述。
+当前状态：**R0 优化前基线和 R1 正确性护栏已经完成，尚未修改 GDN kernel。** 文中标为“待测”的内容是后续实验计划，不能作为已经取得的结果对外陈述。
 
 ## 1. 面试讲解主线
 
@@ -242,7 +242,7 @@ grid  = (4 V-column tiles, 32 heads) = 128 blocks
 | 轮次 | Commit | 主要变化 | Event median | Event p95 | NCU duration | Achieved occupancy | Eligible | Long scoreboard | Registers | Local ld/st | 结论 |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | R0 | `304eea3` | 原始一列一线程、state 两趟扫描 | 16.384 us | 24.256 us | 26.880 us | 7.71% | 5.37% | 79.48% | 40 | 0 / 0 | 优化前基线 |
-| R1 | 待提交 | 非零 state、多步正确性护栏 | 待测 | 待测 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 待完成 |
+| R1 | `test(qwen35): strengthen recurrent GDN coverage` | 非零 state、多步正确性护栏 | 不变 | 不变 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 已完成；55/55 GTest、4/4 CTest |
 | R2 | 待提交 | 标量/q cache 与循环不变量外提 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
 | R3 | 待提交 | 二维 K/V tile | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
 | R4 | 待提交 | state 单次读取 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待完成 |
@@ -266,6 +266,18 @@ NCU：duration；grid/block；waves/SM；achieved occupancy；eligible/no eligib
 接受、继续调整或回退：
 报告目录与 SHA-256：
 ```
+
+### 9.3 R1：优化前正确性护栏
+
+R1 没有修改 kernel，也没有声称取得性能收益。新增测试直接比较 CPU 与 CUDA 的 output 和完整 recurrent state：
+
+- 通用 grouped shape：`nk=2, nv=4, kd=32, vd=48`，非零初始 state，在第 1、16 步检查；
+- Qwen3.5-4B 实际 shape：`nk=16, nv=32, kd=vd=128`，非零初始 state，在第 1、16、128 步检查；
+- q/k 按 head 归一化，g、beta、v 和 state 使用确定性非平凡数据；
+- 误差门槛为 `2e-4 * max(reference_scale, 1)`，并检查所有 CUDA 结果为有限值；
+- focused GDN 测试 3/3 通过，完整 GTest 55/55、CTest 4/4 通过。
+
+这一轮补上了原 benchmark “零 state、单步”无法覆盖的递推风险。后续循环重排即使第一步看似正确，只要误差随 state 累积或 state 原位更新发生错误，16/128 步检查都能暴露问题。
 
 ## 10. 前后结果表（优化完成后填写）
 
