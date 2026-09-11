@@ -25,13 +25,17 @@ mkdir -p "$OUTPUT_DIR"
 {
   printf 'NCU_SET=%q NCU_REPLAY_MODE=%q NCU_LAUNCH_COUNT=%q ' \
     "$NCU_SET" "$NCU_REPLAY_MODE" "$NCU_LAUNCH_COUNT"
-  printf '%q ' ncu --set "$NCU_SET" --replay-mode "$NCU_REPLAY_MODE" \
+  printf '%q ' ncu --set "$NCU_SET" --section SchedulerStats --section WarpStateStats \
+    --cache-control all --replay-mode "$NCU_REPLAY_MODE" \
     --kernel-name-base function --kernel-name "regex:$KERNEL_REGEX" \
     --launch-count "$NCU_LAUNCH_COUNT" --force-overwrite --export "$OUTPUT_PREFIX" "$@"
   printf '\n'
 } >"${OUTPUT_PREFIX}.command.txt"
 ncu \
   --set "$NCU_SET" \
+  --section SchedulerStats \
+  --section WarpStateStats \
+  --cache-control all \
   --replay-mode "$NCU_REPLAY_MODE" \
   --kernel-name-base function \
   --kernel-name "regex:$KERNEL_REGEX" \

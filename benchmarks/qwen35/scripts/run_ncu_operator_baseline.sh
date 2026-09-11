@@ -27,7 +27,7 @@ profile_matmul() {
   local output_size="$3"
   "$SCRIPT_DIR/profile_ncu.sh" "$OUTPUT_DIR/$name" "$MATMUL_KERNEL" -- \
     "$BENCH" --mode matmul --device cuda --dtype bf16 \
-    --m "$input_size" --k "$output_size" --cache cold --warmup 0 --repeat 1
+    --m "$input_size" --k "$output_size" --cache warm --warmup 0 --repeat 1
 }
 
 for case_name in "$@"; do

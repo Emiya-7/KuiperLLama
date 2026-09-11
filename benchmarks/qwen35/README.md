@@ -120,14 +120,17 @@ The profiling helper filters by CUDA kernel function, profiles one matching
 launch, captures the environment, exports the `.ncu-rep`, writes a SHA-256, and
 also exports a reviewable raw CSV. Kernel replay is safe here because each
 microbenchmark has deterministic inputs and NCU restores memory modified by a
-replayed launch.
+replayed launch. NCU uses `--cache-control all`; the matmul command uses its
+`warm` setting only to disable the benchmark's own 96 MiB memset. NCU therefore
+profiles a cold-cache kernel without dirty cache-flush traffic contaminating
+the target kernel's DRAM counters.
 
 ```bash
 benchmarks/qwen35/scripts/profile_ncu.sh \
   /tmp/qwen35-ncu/matmul-gdn-qkv '.*matmul_kernel_cu_fp32bf16.*' -- \
   ./build/demo/qwen35_bench \
     --mode matmul --device cuda --dtype bf16 \
-    --m 2560 --k 8192 --cache cold --warmup 0 --repeat 1
+    --m 2560 --k 8192 --cache warm --warmup 0 --repeat 1
 
 benchmarks/qwen35/scripts/profile_ncu.sh \
   /tmp/qwen35-ncu/gdn '.*gated_delta_step_kernel.*' -- \
@@ -155,8 +158,10 @@ The cases intentionally cover different bottleneck regimes:
 | `lm_head` | K=248320, M=2560 | bandwidth-heavy vocabulary head |
 
 The default `detailed` set records Speed of Light, occupancy, compute workload,
-memory workload, and source counters. Override `NCU_SET` only for a focused
-follow-up; the `full` set is too expensive for routine before/after collection.
+memory workload, and source counters. The helper also adds Scheduler Statistics
+and Warp State Statistics so issue efficiency and stall reasons are available
+in every before/after report. Override `NCU_SET` only for a focused follow-up;
+the `full` set is too expensive for routine collection.
 
 If NCU reports `ERR_NVGPUCTRPERM` under WSL2, enable access on the Windows host:
 
