@@ -11,6 +11,7 @@ endif()
 
 project(llama_infer CXX CUDA)
 include(cmake/cuda.cmake)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
@@ -39,6 +40,7 @@ if (QWEN35_SUPPORT)
   message(STATUS "QWEN3.5 SUPPORT")
   add_definitions(-DQWEN35_SUPPORT)
 endif()
+option(KUIPER_ENABLE_NVTX "Enable NVTX annotations for CUDA profiling" ON)
 # ---- Add dependencies via CPM ----
 # see https://github.com/TheLartians/CPM.cmake for more info
 option(USE_CPM "Use CPM for dependency management" OFF)
@@ -64,6 +66,7 @@ if(USE_CPM)
     NAME Armadillo
     GITLAB_REPOSITORY conradsnicta/armadillo-code
     GIT_TAG 14.0.1
+    OPTIONS "BUILD_SMOKE_TEST Off"
   )
 
   CPMAddPackage(
@@ -111,6 +114,13 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 
 add_library(llama SHARED ${DIR_TENSOR} ${DIR_BASE} ${DIR_OP} ${DIR_KERNEL} ${DIR_MODEL} ${DIR_KERNEL_CPU} ${DIR_KERNEL_CUDA} ${DIR_KERNEL} ${DIR_SAMPLE})
 target_link_libraries(llama sentencepiece glog::glog gtest gtest_main pthread cudart armadillo)
+if(KUIPER_ENABLE_NVTX)
+  if(NOT TARGET CUDA::nvtx3)
+    message(FATAL_ERROR "KUIPER_ENABLE_NVTX requires the CUDA Toolkit nvtx3 target")
+  endif()
+  target_link_libraries(llama CUDA::nvtx3)
+  target_compile_definitions(llama PUBLIC KUIPER_ENABLE_NVTX)
+endif()
 target_link_directories(llama PUBLIC ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/lib64)
 
 target_include_directories(llama PUBLIC ${glog_INCLUDE_DIR})
@@ -124,5 +134,7 @@ if(USE_CPM)
 endif()
 
 set_target_properties(llama PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-add_subdirectory(test)
+if(BUILD_TESTING)
+  add_subdirectory(test)
+endif()
 add_subdirectory(demo)

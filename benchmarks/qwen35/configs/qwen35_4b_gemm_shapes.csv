@@ -1,0 +1,7 @@
+name,batch_size_n,input_size_m,output_size_k,weight_dtype,workload
+gdn_z_n8,8,2560,4096,bf16,prefill
+gdn_z_n32,32,2560,4096,bf16,prefill
+gdn_z_n128,128,2560,4096,bf16,prefill
+gdn_out_n32,32,4096,2560,bf16,prefill
+mlp_up_n32,32,2560,9216,bf16,prefill
+mlp_down_n32,32,9216,2560,bf16,prefill

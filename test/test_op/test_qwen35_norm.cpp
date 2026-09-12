@@ -126,7 +126,6 @@ TEST(Qwen35ZeroCenteredRMSNorm, CudaMatchesCpu) {
   for (int32_t i = 0; i < kRows * kDim; ++i) {
     EXPECT_NEAR(output_cuda.index<float>(i), output_cpu.index<float>(i), 1e-6f) << "index=" << i;
   }
-  EXPECT_EQ(cudaStreamDestroy(cuda_config->stream), cudaSuccess);
 }
 
 #endif  // QWEN35_SUPPORT

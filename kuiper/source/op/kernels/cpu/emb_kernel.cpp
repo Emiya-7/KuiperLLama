@@ -1,4 +1,5 @@
 #include "emb_kernel.h"
+#include "base/bfloat16.h"
 namespace kernel {
 
 void emb_kernel_normal(const tensor::Tensor& input, const tensor::Tensor& weight,
@@ -17,10 +18,18 @@ void emb_kernel_normal(const tensor::Tensor& input, const tensor::Tensor& weight
       LOG(FATAL) << "Token index is greater than vocab size.";
     } else {
       float* dest_ptr = const_cast<float*>(output.ptr<float>(i * weight_dim));
-      float* src_ptr = const_cast<float*>(weight.ptr<float>(token * weight_dim));
       if (weight.device_type() == base::DeviceType::kDeviceCPU) {
-        allocator->memcpy(src_ptr, dest_ptr, weight_dim * sizeof(float),
-                          base::MemcpyKind::kMemcpyCPU2CPU);
+        if (weight.data_type() == base::DataType::kDataTypeFp32) {
+          const float* src_ptr = weight.ptr<float>(token * weight_dim);
+          allocator->memcpy(src_ptr, dest_ptr, weight_dim * sizeof(float),
+                            base::MemcpyKind::kMemcpyCPU2CPU);
+        } else {
+          CHECK(weight.data_type() == base::DataType::kDataTypeBf16);
+          const uint16_t* src_ptr = weight.ptr<uint16_t>(token * weight_dim);
+          for (int32_t column = 0; column < weight_dim; ++column) {
+            dest_ptr[column] = base::bfloat16_to_float(src_ptr[column]);
+          }
+        }
       } else {
         LOG(FATAL) << "Unknown device type of weight tensor in the embedding layer.";
       }

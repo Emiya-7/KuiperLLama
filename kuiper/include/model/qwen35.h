@@ -122,6 +122,13 @@ class Qwen35Model : public Model {
 
   const Qwen35Config& qwen35_config() const { return q35_; }
 
+  // Exposes the model-owned execution stream to observability tools that must
+  // order device-to-host copies after asynchronous CUDA kernels. Returns null
+  // for CPU models. Callers must not destroy or otherwise take ownership of it.
+  cudaStream_t cuda_stream() const {
+    return cuda_config_ ? cuda_config_->stream : nullptr;
+  }
+
   // Zeroes the recurrent and conv states. Must be called before starting a new
   // sequence: unlike a KV cache, which is overwritten position by position, the
   // GDN state accumulates and would otherwise leak across sequences.
@@ -180,6 +187,7 @@ class Qwen35Model : public Model {
   std::unique_ptr<Qwen35Layers> layers_;
   mutable std::map<Qwen35Buffer, tensor::Tensor> q35_buffers_;
   HiddenStateCallback hidden_state_callback_;
+  size_t header_size_ = 0;
 };
 
 }  // namespace model

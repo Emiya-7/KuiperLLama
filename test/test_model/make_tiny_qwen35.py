@@ -4,9 +4,10 @@
 Structurally identical to the published 4B/9B models -- full_attention_interval 4,
 2 value heads per key head, partial_rotary_factor 0.25, tied embeddings -- but with
 small hidden/intermediate sizes so the tests stay fast. The vocabulary is kept at
-the real 248320 so the shipped tokenizer.json can be used unchanged.
+the real 248320, and a deterministic tokenizer fixture preserves Qwen3.5's
+248070 valid-token boundary without downloading model files.
 
-Writes a safetensors file plus config.json, then leaves it to
+Writes a safetensors file, config.json, and tokenizer.json, then leaves it to
 tools/export_qwen35/export.py to produce the .bin the tests load.
 
 Needs numpy. Usage:
@@ -42,6 +43,56 @@ TINY = dict(
 )
 
 LM = "model.language_model."
+BASE_VOCAB_SIZE = 248044
+SPECIAL_TOKEN_COUNT = 26
+
+
+def write_tokenizer(out_dir):
+    """Write the smallest deterministic tokenizer that retains real Qwen IDs.
+
+    The seven ordinary tokens below make the alignment-test prompt encode to
+    the same IDs as the published tokenizer. Remaining entries are inert filler
+    tokens: QwenEncodeLayer counts entries to establish the valid sampling
+    boundary, so keeping all 248044 base IDs also tests the 248070/248320
+    tokenizer-versus-embedding padding split.
+    """
+
+    known_tokens = {
+        30: "?",
+        198: "Ċ",  # GPT-2 byte alphabet representation of newline.
+        369: "Ġis",
+        846: "user",
+        3710: "What",
+        14791: "ĠAI",
+        74455: "assistant",
+    }
+    added_tokens = [
+        {"id": BASE_VOCAB_SIZE, "content": "<|endoftext|>"},
+        {"id": BASE_VOCAB_SIZE + 1, "content": "<|im_start|>"},
+        {"id": BASE_VOCAB_SIZE + 2, "content": "<|im_end|>"},
+    ]
+    for token_id in range(BASE_VOCAB_SIZE + 3, BASE_VOCAB_SIZE + SPECIAL_TOKEN_COUNT):
+        added_tokens.append(
+            {
+                "id": token_id,
+                "content": f"<|reserved_special_token_{token_id - BASE_VOCAB_SIZE - 3}|>",
+            }
+        )
+
+    path = os.path.join(out_dir, "tokenizer.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"model":{"vocab":{')
+        for token_id in range(BASE_VOCAB_SIZE):
+            if token_id:
+                f.write(",")
+            token = known_tokens.get(token_id, f"<unused_{token_id}>")
+            f.write(json.dumps(token, ensure_ascii=False))
+            f.write(":")
+            f.write(str(token_id))
+        f.write('}},"added_tokens":')
+        json.dump(added_tokens, f, ensure_ascii=False, separators=(",", ":"))
+        f.write("}\n")
+    return path
 
 
 def tensor_specs(c):
@@ -111,6 +162,7 @@ def main():
             f,
             indent=2,
         )
+    tokenizer_path = write_tokenizer(args.out_dir)
 
     rng = np.random.default_rng(args.seed)
     header, blobs, offset = {}, [], 0
@@ -149,7 +201,7 @@ def main():
             f.write(b)
 
     print(f"wrote {out}: {len(header)} tensors, {offset / 1e6:.1f} MB")
-    print("Copy a real tokenizer.json into this directory, then run export.py.")
+    print(f"wrote {tokenizer_path}: {BASE_VOCAB_SIZE + SPECIAL_TOKEN_COUNT} valid token IDs")
 
 
 if __name__ == "__main__":

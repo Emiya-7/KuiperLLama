@@ -7,7 +7,7 @@ import os
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoTokenizer, Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
 
 DEFAULT_PROMPT = "<|im_start|>user\nWhat is AI?<|im_end|>\n<|im_start|>assistant\n"
@@ -18,6 +18,12 @@ def main():
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="reference compute dtype (default: fp32; use bf16 for large models)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -26,13 +32,23 @@ def main():
     input_ids = torch.tensor([token_ids], dtype=torch.long)
     attention_mask = torch.ones_like(input_ids)
 
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    with open(os.path.join(args.model_dir, "config.json")) as file:
+        serialized_config = json.load(file)
+    text_config = Qwen3_5TextConfig(
+        **serialized_config.get("text_config", serialized_config)
+    )
+    torch_dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
+    # Loading the causal LM directly avoids materializing the unused vision and
+    # MTP towers from the multimodal checkpoint. Transformers maps the
+    # model.language_model.* checkpoint prefix onto the text model here.
+    model = Qwen3_5ForCausalLM.from_pretrained(
         args.model_dir,
-        dtype=torch.float32,
+        config=text_config,
+        dtype=torch_dtype,
         attn_implementation="eager",
     )
     model.eval()
-    text_model = model.model.language_model
+    text_model = model.model
     hidden = [None] * (len(text_model.layers) + 1)
     hooks = []
 
@@ -95,6 +111,7 @@ def main():
 
     metadata = {
         "implementation": "transformers",
+        "dtype": args.dtype,
         "sequence_length": len(token_ids),
         "hidden_size": int(text_model.config.hidden_size),
         "num_hidden_layers": len(text_model.layers),

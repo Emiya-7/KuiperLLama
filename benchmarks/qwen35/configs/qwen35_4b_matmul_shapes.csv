@@ -1,0 +1,14 @@
+name,input_size_m,output_size_k,weight_dtype,workload
+gdn_qkv,2560,8192,bf16,decode
+gdn_z,2560,4096,bf16,decode
+gdn_a,2560,32,bf16,decode
+gdn_b,2560,32,bf16,decode
+gdn_out,4096,2560,bf16,decode
+full_q,2560,8192,bf16,decode
+full_k,2560,1024,bf16,decode
+full_v,2560,1024,bf16,decode
+full_out,4096,2560,bf16,decode
+mlp_gate,2560,9216,bf16,decode
+mlp_up,2560,9216,bf16,decode
+mlp_down,9216,2560,bf16,decode
+lm_head,2560,248320,bf16,decode

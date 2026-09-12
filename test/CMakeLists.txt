@@ -31,3 +31,41 @@ target_link_libraries(test_llm llama)
 
 set_target_properties(test_llm PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_target_properties(test_llm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+if(QWEN35_SUPPORT)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(QWEN35_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/fixtures/qwen35)
+    set(QWEN35_FIXTURE_MODEL ${QWEN35_FIXTURE_DIR}/tiny-qwen35-bf16.bin)
+    set(QWEN35_FIXTURE_TOKENIZER ${QWEN35_FIXTURE_DIR}/tokenizer.json)
+
+    add_test(
+        NAME qwen35_tiny_fixture
+        COMMAND ${CMAKE_COMMAND}
+            -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
+            -DQWEN35_FIXTURE_DIR=${QWEN35_FIXTURE_DIR}
+            -DQWEN35_FIXTURE_GENERATOR=${CMAKE_CURRENT_SOURCE_DIR}/test_model/make_tiny_qwen35.py
+            -DQWEN35_EXPORTER=${CMAKE_SOURCE_DIR}/tools/export_qwen35/export.py
+            -DQWEN35_FIXTURE_MODEL=${QWEN35_FIXTURE_MODEL}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/prepare_qwen35_fixture.cmake
+    )
+    set_tests_properties(qwen35_tiny_fixture PROPERTIES
+        FIXTURES_SETUP qwen35_tiny
+        LABELS fixture
+        TIMEOUT 120
+    )
+endif()
+
+add_test(NAME test_llm COMMAND $<TARGET_FILE:test_llm>)
+set_tests_properties(test_llm PROPERTIES
+    LABELS "gpu;qwen35"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    RUN_SERIAL TRUE
+    TIMEOUT 300
+)
+if(QWEN35_SUPPORT)
+    set_tests_properties(test_llm PROPERTIES
+        FIXTURES_REQUIRED qwen35_tiny
+        ENVIRONMENT
+            "GLOG_logtostderr=1;KUIPER_TINY_QWEN35=${QWEN35_FIXTURE_MODEL};KUIPER_TINY_QWEN35_TOKENIZER=${QWEN35_FIXTURE_TOKENIZER}"
+    )
+endif()

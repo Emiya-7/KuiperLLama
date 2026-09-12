@@ -28,7 +28,12 @@ base::Status EmbeddingLayer::check() const {
     return status;
   }
 
-  status = check_tensor_with_dim(get_weight(0), device_type_, data_type_, vocab_size_, dim_);
+  const auto weight_type = get_weight(0).data_type();
+  if (weight_type != base::DataType::kDataTypeFp32 &&
+      weight_type != base::DataType::kDataTypeBf16) {
+    return base::error::InvalidArgument("Embedding weight must be fp32 or bf16.");
+  }
+  status = check_tensor_with_dim(get_weight(0), device_type_, weight_type, vocab_size_, dim_);
   if (!status) {
     LOG(ERROR) << "The weight tensor error in the embedding layer.";
     return status;

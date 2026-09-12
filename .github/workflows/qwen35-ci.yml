@@ -1,0 +1,61 @@
+name: Qwen3.5 CUDA CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  workflow_dispatch:
+
+concurrency:
+  group: qwen35-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    # The additional gpu label prevents this job from landing on a self-hosted
+    # machine that has no NVIDIA device. The runner must provide CUDA 12.8 at
+    # ~/.local/opt/cuda-12.8, matching tools/env.sh.
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify CUDA runner
+        run: |
+          source tools/env.sh
+          nvcc --version
+          nvidia-smi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install fixture dependency
+        run: python -m pip install numpy
+
+      - name: Configure Qwen3.5 build
+        run: |
+          source tools/env.sh
+          cmake -S . -B build-ci \
+            -DUSE_CPM=ON \
+            -DQWEN35_SUPPORT=ON \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DCMAKE_CUDA_ARCHITECTURES=89 \
+            -DCUDAToolkit_ROOT="$CUDA_HOME" \
+            -DPython3_EXECUTABLE="$(command -v python)"
+
+      - name: Build tests
+        run: |
+          source tools/env.sh
+          cmake --build build-ci --target test_llm -j2
+
+      - name: Run CTest with generated tiny fixture
+        run: |
+          source tools/env.sh
+          ctest --test-dir build-ci --output-on-failure --timeout 300

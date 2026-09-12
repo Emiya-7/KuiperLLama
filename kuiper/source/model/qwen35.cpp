@@ -10,11 +10,22 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <utility>
+#include "base/nvtx.h"
 #include "../op/kernels/cpu/qwen35_kernel.h"
 #include "../op/kernels/cuda/qwen35_kernel.cuh"
 
 namespace model {
+namespace {
+
+template <typename Callable>
+void profiled_status(const char* name, Callable&& callable) {
+  base::ScopedNvtxRange range(name);
+  STATUS_CHECK(callable());
+}
+
+}  // namespace
 
 void Qwen35Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   auto move = [&config](const std::shared_ptr<op::Layer>& layer) {
@@ -26,8 +37,23 @@ void Qwen35Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
 
   move(add_layer_);
   move(swiglu_layer_);
+
+  // Tied checkpoints point embedding and lm_head at the same mmap range. A
+  // naive pair of Tensor::to_cuda calls allocates and copies that table twice
+  // (about 1.27 GB for Qwen3.5-4B BF16). Detect the shared host storage before
+  // moving it, then bind the classifier to the embedding's device buffer.
+  const auto embedding = std::dynamic_pointer_cast<op::EmbeddingLayer>(embedding_layer_);
+  const auto classifier = std::dynamic_pointer_cast<op::MatmulLayer>(cls_layer_);
+  const bool tied_weights = embedding && classifier &&
+                            embedding->get_weight(0).ptr<uint8_t>() ==
+                                classifier->get_weight(0).ptr<uint8_t>();
   move(embedding_layer_);
-  move(cls_layer_);
+  if (tied_weights) {
+    classifier->set_cuda_config(config);
+    classifier->set_weight(0, embedding->get_weight(0));
+  } else {
+    move(cls_layer_);
+  }
   move(final_norm_);
   move(mha_layer_);
   move(rope_layer_);
@@ -115,23 +141,64 @@ base::Status Qwen35Model::read_model_file() {
     return error::PathNotValid("Failed to open the weight file " + model_path_);
   }
 
-  Qwen35RawConfig raw{};
-  if (fread(&raw, sizeof(Qwen35RawConfig), 1, file) != 1) {
+  int32_t prefix[2]{};
+  if (fread(prefix, sizeof(prefix), 1, file) != 1) {
     fclose(file);
     close(fd);
     return error::ModelParseError("Failed to read the Qwen3.5 header.");
   }
-  fclose(file);
-
-  if (raw.magic != kQwen35Magic) {
+  if (prefix[0] != kQwen35Magic) {
+    fclose(file);
     close(fd);
     return error::ModelParseError(
         "Not a Qwen3.5 model file (bad magic). Export it with tools/export_qwen35/export.py.");
   }
-  if (raw.version != kQwen35Version) {
+  if (prefix[1] != 2 && prefix[1] != kQwen35Version) {
+    fclose(file);
     close(fd);
     return error::ModelParseError("Unsupported Qwen3.5 model file version.");
   }
+
+  rewind(file);
+  Qwen35RawConfig raw{};
+  if (prefix[1] == 2) {
+    Qwen35RawConfigV2 legacy{};
+    if (fread(&legacy, sizeof(legacy), 1, file) != 1) {
+      fclose(file);
+      close(fd);
+      return error::ModelParseError("Failed to read the Qwen3.5 v2 header.");
+    }
+    raw.magic = legacy.magic;
+    raw.version = legacy.version;
+    raw.hidden_size = legacy.hidden_size;
+    raw.intermediate_size = legacy.intermediate_size;
+    raw.layer_num = legacy.layer_num;
+    raw.vocab_size = legacy.vocab_size;
+    raw.max_seq_len = legacy.max_seq_len;
+    raw.head_num = legacy.head_num;
+    raw.kv_head_num = legacy.kv_head_num;
+    raw.head_dim = legacy.head_dim;
+    raw.rotary_dim = legacy.rotary_dim;
+    raw.full_attention_interval = legacy.full_attention_interval;
+    raw.linear_num_k_heads = legacy.linear_num_k_heads;
+    raw.linear_num_v_heads = legacy.linear_num_v_heads;
+    raw.linear_k_head_dim = legacy.linear_k_head_dim;
+    raw.linear_v_head_dim = legacy.linear_v_head_dim;
+    raw.conv_kernel_size = legacy.conv_kernel_size;
+    raw.tie_word_embeddings = legacy.tie_word_embeddings;
+    raw.matrix_weight_type = static_cast<int32_t>(Qwen35MatrixWeightType::kFp32);
+    raw.rope_theta = legacy.rope_theta;
+    raw.rms_norm_eps = legacy.rms_norm_eps;
+    header_size_ = sizeof(legacy);
+  } else {
+    if (fread(&raw, sizeof(raw), 1, file) != 1) {
+      fclose(file);
+      close(fd);
+      return error::ModelParseError("Failed to read the Qwen3.5 v3 header.");
+    }
+    header_size_ = sizeof(raw);
+  }
+  fclose(file);
   // Validate every divisor before deriving dimensions. In particular,
   // Qwen35Config::derive() divides by full_attention_interval, so checking it
   // afterwards would let a malformed header terminate the process first.
@@ -161,6 +228,11 @@ base::Status Qwen35Model::read_model_file() {
     return error::ModelParseError(
         "Qwen3.5 linear-attention dimensions are invalid or v heads are not grouped by k heads.");
   }
+  if (raw.matrix_weight_type != static_cast<int32_t>(Qwen35MatrixWeightType::kFp32) &&
+      raw.matrix_weight_type != static_cast<int32_t>(Qwen35MatrixWeightType::kBf16)) {
+    close(fd);
+    return error::ModelParseError("Qwen3.5 matrix weight type must be FP32 or BF16.");
+  }
 
   q35_.hidden_size = raw.hidden_size;
   q35_.intermediate_size = raw.intermediate_size;
@@ -178,6 +250,7 @@ base::Status Qwen35Model::read_model_file() {
   q35_.linear_v_head_dim = raw.linear_v_head_dim;
   q35_.conv_kernel_size = raw.conv_kernel_size;
   q35_.tie_word_embeddings = raw.tie_word_embeddings != 0;
+  q35_.matrix_weight_type = static_cast<Qwen35MatrixWeightType>(raw.matrix_weight_type);
   q35_.rope_theta = raw.rope_theta;
   q35_.rms_norm_eps = raw.rms_norm_eps;
   q35_.derive();
@@ -215,12 +288,13 @@ base::Status Qwen35Model::read_model_file() {
     return error::ModelParseError("Failed to mmap the weight file " + model_path_);
   }
   raw_model_data_->weight_data =
-      static_cast<int8_t*>(raw_model_data_->data) + sizeof(Qwen35RawConfig);
+      static_cast<int8_t*>(raw_model_data_->data) + header_size_;
 
   LOG(INFO) << "Qwen3.5: hidden=" << q35_.hidden_size << " layers=" << q35_.layer_num << " ("
             << q35_.full_layer_num << " full / " << q35_.linear_layer_num << " linear)"
             << " head_dim=" << q35_.head_dim << " rotary_dim=" << q35_.rotary_dim
-            << " tie_emb=" << q35_.tie_word_embeddings;
+            << " tie_emb=" << q35_.tie_word_embeddings << " matrix_dtype="
+            << (q35_.matrix_weight_type == Qwen35MatrixWeightType::kBf16 ? "bf16" : "fp32");
   return error::Success();
 }
 
@@ -277,24 +351,45 @@ void Qwen35Model::create_nonparam_layers() {
 void Qwen35Model::create_param_layers() {
   CHECK(layers_ != nullptr);
   const auto cpu = base::DeviceType::kDeviceCPU;
+  const auto matrix_type = q35_.matrix_weight_type == Qwen35MatrixWeightType::kBf16
+                               ? base::DataType::kDataTypeBf16
+                               : base::DataType::kDataTypeFp32;
   const int32_t hidden = q35_.hidden_size;
   const int32_t inter = q35_.intermediate_size;
 
-  // Offsets are in floats and must track tools/export_qwen35/export.py exactly.
+  // Version 3 stores large matrices in the header-selected dtype while keeping
+  // norms, convolution and decay parameters in FP32. Byte offsets therefore
+  // replace the old float-element cursor and must track export.py exactly.
   size_t pos = 0;
+  const auto* weight_data = static_cast<const uint8_t*>(raw_model_data_->weight_data);
+  auto take = [&](size_t elements, bool matrix) -> const void* {
+    const auto dtype = matrix ? matrix_type : base::DataType::kDataTypeFp32;
+    const void* result = weight_data + pos;
+    pos += elements * base::DataTypeSize(dtype);
+    return result;
+  };
+  auto set_matrix = [&](const std::shared_ptr<op::Layer>& layer,
+                        const std::vector<int32_t>& dims) {
+    const size_t elements =
+        std::accumulate(dims.begin(), dims.end(), size_t{1}, std::multiplies<>());
+    layer->set_weight(0, dims, take(elements, true), cpu, matrix_type);
+  };
+  auto set_fp32 = [&](const std::shared_ptr<op::Layer>& layer, int32_t index,
+                      const std::vector<int32_t>& dims) {
+    const size_t elements =
+        std::accumulate(dims.begin(), dims.end(), size_t{1}, std::multiplies<>());
+    layer->set_weight(index, dims, take(elements, false), cpu);
+  };
 
   layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
       device_type_, hidden, q35_.max_seq_len, q35_.vocab_size);
-  layers_->embedding_layer_->set_weight(0, {q35_.vocab_size, hidden},
-                                        raw_model_data_->weight(pos), cpu);
-  const size_t embedding_pos = pos;
-  pos += static_cast<size_t>(q35_.vocab_size) * hidden;
+  const void* embedding_weight = weight_data + pos;
+  set_matrix(layers_->embedding_layer_, {q35_.vocab_size, hidden});
 
   auto final_norm = std::make_shared<op::ZeroCenteredRMSNormLayer>(
       device_type_, hidden, q35_.rms_norm_eps);
-  final_norm->set_weight(0, {hidden}, raw_model_data_->weight(pos), cpu);
+  set_fp32(final_norm, 0, {hidden});
   layers_->final_norm_ = final_norm;
-  pos += hidden;
 
   layers_->input_norms_.resize(q35_.layer_num);
   layers_->post_attn_norms_.resize(q35_.layer_num);
@@ -307,128 +402,104 @@ void Qwen35Model::create_param_layers() {
   for (int32_t i = 0; i < q35_.layer_num; ++i) {
     auto in_norm = std::make_shared<op::ZeroCenteredRMSNormLayer>(
         device_type_, hidden, q35_.rms_norm_eps);
-    in_norm->set_weight(0, {hidden}, raw_model_data_->weight(pos), cpu);
+    set_fp32(in_norm, 0, {hidden});
     layers_->input_norms_[i] = in_norm;
-    pos += hidden;
 
     const int32_t local = q35_.type_local_idx(i);
     if (q35_.layer_type(i) == Qwen35LayerType::kFullAttention) {
       auto& f = layers_->full_layers_[local];
 
       f.wq = std::make_shared<op::MatmulLayer>(device_type_, q35_.q_proj_out, hidden, false);
-      f.wq->set_weight(0, {q35_.q_proj_out, hidden}, raw_model_data_->weight(pos), cpu);
-      pos += static_cast<size_t>(q35_.q_proj_out) * hidden;
+      set_matrix(f.wq, {q35_.q_proj_out, hidden});
 
       f.wk = std::make_shared<op::MatmulLayer>(device_type_, q35_.kv_dim, hidden, false);
-      f.wk->set_weight(0, {q35_.kv_dim, hidden}, raw_model_data_->weight(pos), cpu);
-      pos += static_cast<size_t>(q35_.kv_dim) * hidden;
+      set_matrix(f.wk, {q35_.kv_dim, hidden});
 
       f.wv = std::make_shared<op::MatmulLayer>(device_type_, q35_.kv_dim, hidden, false);
-      f.wv->set_weight(0, {q35_.kv_dim, hidden}, raw_model_data_->weight(pos), cpu);
-      pos += static_cast<size_t>(q35_.kv_dim) * hidden;
+      set_matrix(f.wv, {q35_.kv_dim, hidden});
 
       // Qwen3.5 uses the same zero-centered (1 + weight) RMSNorm for Q/K,
       // independently over every head.
       f.q_norm = std::make_shared<op::ZeroCenteredRMSNormLayer>(
           device_type_, q35_.head_dim, q35_.rms_norm_eps);
-      f.q_norm->set_weight(0, {q35_.head_dim}, raw_model_data_->weight(pos), cpu);
-      pos += q35_.head_dim;
+      set_fp32(f.q_norm, 0, {q35_.head_dim});
 
       f.k_norm = std::make_shared<op::ZeroCenteredRMSNormLayer>(
           device_type_, q35_.head_dim, q35_.rms_norm_eps);
-      f.k_norm->set_weight(0, {q35_.head_dim}, raw_model_data_->weight(pos), cpu);
-      pos += q35_.head_dim;
+      set_fp32(f.k_norm, 0, {q35_.head_dim});
 
       f.wo = std::make_shared<op::MatmulLayer>(device_type_, hidden, q35_.q_dim, false);
-      f.wo->set_weight(0, {hidden, q35_.q_dim}, raw_model_data_->weight(pos), cpu);
-      pos += static_cast<size_t>(hidden) * q35_.q_dim;
+      set_matrix(f.wo, {hidden, q35_.q_dim});
     } else {
       auto& l = layers_->linear_layers_[local];
 
       l.in_proj_qkv = std::make_shared<op::MatmulLayer>(device_type_, q35_.conv_dim, hidden, false);
-      l.in_proj_qkv->set_weight(0, {q35_.conv_dim, hidden}, raw_model_data_->weight(pos), cpu);
-      pos += static_cast<size_t>(q35_.conv_dim) * hidden;
+      set_matrix(l.in_proj_qkv, {q35_.conv_dim, hidden});
 
       l.in_proj_z = std::make_shared<op::MatmulLayer>(device_type_, q35_.linear_v_dim, hidden, false);
-      l.in_proj_z->set_weight(0, {q35_.linear_v_dim, hidden}, raw_model_data_->weight(pos), cpu);
-      pos += static_cast<size_t>(q35_.linear_v_dim) * hidden;
+      set_matrix(l.in_proj_z, {q35_.linear_v_dim, hidden});
 
       l.in_proj_a =
           std::make_shared<op::MatmulLayer>(device_type_, q35_.linear_num_v_heads, hidden, false);
-      l.in_proj_a->set_weight(0, {q35_.linear_num_v_heads, hidden}, raw_model_data_->weight(pos),
-                              cpu);
-      pos += static_cast<size_t>(q35_.linear_num_v_heads) * hidden;
+      set_matrix(l.in_proj_a, {q35_.linear_num_v_heads, hidden});
 
       l.in_proj_b =
           std::make_shared<op::MatmulLayer>(device_type_, q35_.linear_num_v_heads, hidden, false);
-      l.in_proj_b->set_weight(0, {q35_.linear_num_v_heads, hidden}, raw_model_data_->weight(pos),
-                              cpu);
-      pos += static_cast<size_t>(q35_.linear_num_v_heads) * hidden;
+      set_matrix(l.in_proj_b, {q35_.linear_num_v_heads, hidden});
 
       l.conv = std::make_shared<op::CausalConv1DLayer>(device_type_, q35_.conv_dim,
                                                        q35_.conv_kernel_size);
       // conv1d.weight ships as [conv_dim, 1, k]; the singleton dim is dropped so
       // the kernel sees a plain [conv_dim, k].
-      l.conv->set_weight(0, {q35_.conv_dim, q35_.conv_kernel_size}, raw_model_data_->weight(pos),
-                         cpu);
-      pos += static_cast<size_t>(q35_.conv_dim) * q35_.conv_kernel_size;
+      set_fp32(l.conv, 0, {q35_.conv_dim, q35_.conv_kernel_size});
 
       l.decay = std::make_shared<op::SoftplusDecayLayer>(device_type_, q35_.linear_num_v_heads);
-      l.decay->set_weight(0, {q35_.linear_num_v_heads}, raw_model_data_->weight(pos), cpu);
-      pos += q35_.linear_num_v_heads;
-      l.decay->set_weight(1, {q35_.linear_num_v_heads}, raw_model_data_->weight(pos), cpu);
-      pos += q35_.linear_num_v_heads;
+      set_fp32(l.decay, 0, {q35_.linear_num_v_heads});
+      set_fp32(l.decay, 1, {q35_.linear_num_v_heads});
 
       l.norm = std::make_shared<op::GatedRMSNormLayer>(device_type_, q35_.linear_v_head_dim,
                                                        q35_.rms_norm_eps);
-      l.norm->set_weight(0, {q35_.linear_v_head_dim}, raw_model_data_->weight(pos), cpu);
-      pos += q35_.linear_v_head_dim;
+      set_fp32(l.norm, 0, {q35_.linear_v_head_dim});
 
       l.out_proj =
           std::make_shared<op::MatmulLayer>(device_type_, hidden, q35_.linear_v_dim, false);
-      l.out_proj->set_weight(0, {hidden, q35_.linear_v_dim}, raw_model_data_->weight(pos), cpu);
-      pos += static_cast<size_t>(hidden) * q35_.linear_v_dim;
+      set_matrix(l.out_proj, {hidden, q35_.linear_v_dim});
     }
 
     auto post_norm = std::make_shared<op::ZeroCenteredRMSNormLayer>(
         device_type_, hidden, q35_.rms_norm_eps);
-    post_norm->set_weight(0, {hidden}, raw_model_data_->weight(pos), cpu);
+    set_fp32(post_norm, 0, {hidden});
     layers_->post_attn_norms_[i] = post_norm;
-    pos += hidden;
 
     auto w1 = std::make_shared<op::MatmulLayer>(device_type_, inter, hidden, false);
-    w1->set_weight(0, {inter, hidden}, raw_model_data_->weight(pos), cpu);
+    set_matrix(w1, {inter, hidden});
     layers_->w1_layers_[i] = w1;
-    pos += static_cast<size_t>(inter) * hidden;
 
     auto w3 = std::make_shared<op::MatmulLayer>(device_type_, inter, hidden, false);
-    w3->set_weight(0, {inter, hidden}, raw_model_data_->weight(pos), cpu);
+    set_matrix(w3, {inter, hidden});
     layers_->w3_layers_[i] = w3;
-    pos += static_cast<size_t>(inter) * hidden;
 
     auto w2 = std::make_shared<op::MatmulLayer>(device_type_, hidden, inter, false);
-    w2->set_weight(0, {hidden, inter}, raw_model_data_->weight(pos), cpu);
+    set_matrix(w2, {hidden, inter});
     layers_->w2_layers_[i] = w2;
-    pos += static_cast<size_t>(hidden) * inter;
   }
 
   auto lm_head = std::make_shared<op::MatmulLayer>(device_type_, q35_.vocab_size, hidden, false);
   if (q35_.tie_word_embeddings) {
     // 4B and 2B ship no lm_head; the embedding matrix is reused, which is also
     // why the export stops before writing one.
-    lm_head->set_weight(0, {q35_.vocab_size, hidden}, raw_model_data_->weight(embedding_pos), cpu);
+    lm_head->set_weight(0, {q35_.vocab_size, hidden}, embedding_weight, cpu, matrix_type);
   } else {
-    lm_head->set_weight(0, {q35_.vocab_size, hidden}, raw_model_data_->weight(pos), cpu);
-    pos += static_cast<size_t>(q35_.vocab_size) * hidden;
+    set_matrix(lm_head, {q35_.vocab_size, hidden});
   }
   layers_->cls_layer_ = lm_head;
 
-  // The header is excluded from weight_data, so `pos` floats must land exactly on
+  // The header is excluded from weight_data, so `pos` bytes must land exactly on
   // the end of the file. A mismatch means the export order and this reader have
   // drifted apart -- fail loudly rather than infer garbage.
-  const size_t expect_bytes = pos * sizeof(float) + sizeof(Qwen35RawConfig);
+  const size_t expect_bytes = pos + header_size_;
   CHECK_EQ(expect_bytes, raw_model_data_->file_size)
-      << "Weight layout mismatch: consumed " << pos << " floats (" << expect_bytes
+      << "Weight layout mismatch: consumed " << pos << " weight bytes (" << expect_bytes
       << " bytes with header) but the file is " << raw_model_data_->file_size << " bytes.";
 }
 
@@ -656,7 +727,7 @@ void Qwen35Model::attention_full(int32_t layer_idx, const tensor::Tensor& pos_te
   // the last axis. So the query and gate of one head are adjacent, and the split
   // is a strided deinterleave rather than two contiguous halves.
   auto qproj = q35_buffer(Qwen35Buffer::kQProj);
-  STATUS_CHECK(f.wq->forward(normed, qproj));
+  profiled_status("matmul.full_q", [&] { return f.wq->forward(normed, qproj); });
   auto query = q35_buffer(Qwen35Buffer::kQuery);
   auto gate = q35_buffer(Qwen35Buffer::kQueryGate);
   // Two outputs, so bind explicitly: the 3-argument forward() overload reads its
@@ -665,24 +736,24 @@ void Qwen35Model::attention_full(int32_t layer_idx, const tensor::Tensor& pos_te
   split.set_input(0, qproj);
   split.set_output(0, query);
   split.set_output(1, gate);
-  STATUS_CHECK(split.forward());
+  profiled_status("split.full_q_gate", [&] { return split.forward(); });
 
   // Per-head QK-norm over head_dim, then partial RoPE. The KV cache holds only
   // full-attention layers, so it is addressed by the full-layer ordinal; passing
   // the absolute layer index here would run off the end of the buffer.
   auto [key, val] = slice_kv_cache(local, pos);
-  STATUS_CHECK(f.wk->forward(normed, key));
-  STATUS_CHECK(f.wv->forward(normed, val));
+  profiled_status("matmul.full_k", [&] { return f.wk->forward(normed, key); });
+  profiled_status("matmul.full_v", [&] { return f.wv->forward(normed, val); });
 
   // ZeroCenteredRMSNormLayer derives the row count from the tensor size, so no
   // reshape is needed around these.
-  STATUS_CHECK(f.q_norm->forward(query, query));
-  STATUS_CHECK(f.k_norm->forward(key, key));
-
-  STATUS_CHECK(layers_->rope_layer_->forward(query, key, pos_tensor,
-                                             get_buffer(ModelBufferType::kSinCache),
-                                             get_buffer(ModelBufferType::kCosCache),
-                                             tensor::Tensor{}));
+  profiled_status("norm.full_q", [&] { return f.q_norm->forward(query, query); });
+  profiled_status("norm.full_k", [&] { return f.k_norm->forward(key, key); });
+  profiled_status("rope.full", [&] {
+    return layers_->rope_layer_->forward(query, key, pos_tensor,
+                                         get_buffer(ModelBufferType::kSinCache),
+                                         get_buffer(ModelBufferType::kCosCache), tensor::Tensor{});
+  });
 
   // Cast only to reach the setters; forward() goes through the base pointer so
   // the multi-argument overload is visible.
@@ -691,15 +762,20 @@ void Qwen35Model::attention_full(int32_t layer_idx, const tensor::Tensor& pos_te
   mha->set_pos(pos);
   mha->set_layer_idx(local);  // KV cache is indexed by full-layer ordinal
   auto attn_out = q35_buffer(Qwen35Buffer::kAttnOut);
-  STATUS_CHECK(layers_->mha_layer_->forward(query, get_buffer(ModelBufferType::kScoreStorage),
-                                            get_buffer(ModelBufferType::kKeyCache),
-                                            get_buffer(ModelBufferType::kValueCache), attn_out));
+  profiled_status("attention.full", [&] {
+    return layers_->mha_layer_->forward(query, get_buffer(ModelBufferType::kScoreStorage),
+                                        get_buffer(ModelBufferType::kKeyCache),
+                                        get_buffer(ModelBufferType::kValueCache), attn_out);
+  });
 
   // attn_out *= sigmoid(gate) -- the gate reuses its own buffer for the sigmoid.
-  STATUS_CHECK(layers_->sigmoid_layer_->forward(gate, gate));
-  STATUS_CHECK(layers_->mul_layer_->forward(attn_out, gate, attn_out));
-
-  STATUS_CHECK(f.wo->forward(attn_out, get_buffer(ModelBufferType::kAttnOutput)));
+  profiled_status("sigmoid.full_gate",
+                  [&] { return layers_->sigmoid_layer_->forward(gate, gate); });
+  profiled_status("mul.full_gate",
+                  [&] { return layers_->mul_layer_->forward(attn_out, gate, attn_out); });
+  profiled_status("matmul.full_out", [&] {
+    return f.wo->forward(attn_out, get_buffer(ModelBufferType::kAttnOutput));
+  });
 }
 
 void Qwen35Model::attention_linear(int32_t layer_idx) const {
@@ -709,13 +785,13 @@ void Qwen35Model::attention_linear(int32_t layer_idx) const {
 
   auto mixed = q35_buffer(Qwen35Buffer::kMixedQKV);
   auto conv_out = q35_buffer(Qwen35Buffer::kConvOut);
-  STATUS_CHECK(l.in_proj_qkv->forward(normed, mixed));
+  profiled_status("matmul.gdn_qkv", [&] { return l.in_proj_qkv->forward(normed, mixed); });
 
   // Depthwise causal conv over the packed [q | k | v], silu fused in. Each linear
   // layer owns one slot of the conv state.
   auto conv_state =
       view(Qwen35Buffer::kConvState, local * q35_.conv_state_size, q35_.conv_state_size);
-  STATUS_CHECK(l.conv->forward(mixed, conv_state, conv_out));
+  profiled_status("conv.gdn", [&] { return l.conv->forward(mixed, conv_state, conv_out); });
 
   // q, k, v are views into the conv output rather than copies. l2norm below
   // writes in place, which keeps them consistent with what the kernel reads.
@@ -726,10 +802,10 @@ void Qwen35Model::attention_linear(int32_t layer_idx) const {
   // L2-normalise q and k per k-head. The 1/sqrt(k_head_dim) query scale is
   // applied inside the delta-rule kernel, matching the reference order.
   q.reshape({q35_.linear_num_k_heads, q35_.linear_k_head_dim});
-  STATUS_CHECK(layers_->q_l2norm_->forward(q, q));
+  profiled_status("norm.gdn_q", [&] { return layers_->q_l2norm_->forward(q, q); });
   q.reshape({q35_.linear_k_dim});
   k.reshape({q35_.linear_num_k_heads, q35_.linear_k_head_dim});
-  STATUS_CHECK(layers_->k_l2norm_->forward(k, k));
+  profiled_status("norm.gdn_k", [&] { return layers_->k_l2norm_->forward(k, k); });
   k.reshape({q35_.linear_k_dim});
 
   // beta = sigmoid(in_proj_b(x)); g = -exp(A_log) * softplus(in_proj_a(x) + dt_bias)
@@ -737,10 +813,11 @@ void Qwen35Model::attention_linear(int32_t layer_idx) const {
   auto b = q35_buffer(Qwen35Buffer::kGdnB);
   auto g = q35_buffer(Qwen35Buffer::kGdnG);
   auto beta = q35_buffer(Qwen35Buffer::kGdnBeta);
-  STATUS_CHECK(l.in_proj_a->forward(normed, a));
-  STATUS_CHECK(l.in_proj_b->forward(normed, b));
-  STATUS_CHECK(l.decay->forward(a, g));
-  STATUS_CHECK(layers_->sigmoid_layer_->forward(b, beta));
+  profiled_status("matmul.gdn_a", [&] { return l.in_proj_a->forward(normed, a); });
+  profiled_status("matmul.gdn_b", [&] { return l.in_proj_b->forward(normed, b); });
+  profiled_status("decay.gdn", [&] { return l.decay->forward(a, g); });
+  profiled_status("sigmoid.gdn_beta",
+                  [&] { return layers_->sigmoid_layer_->forward(b, beta); });
 
   auto state = view(Qwen35Buffer::kRecurrentState, local * q35_.state_size, q35_.state_size);
   auto core = q35_buffer(Qwen35Buffer::kGdnCore);
@@ -753,45 +830,59 @@ void Qwen35Model::attention_linear(int32_t layer_idx) const {
   gdn.set_input(4, beta);
   gdn.set_input(5, state);
   gdn.set_output(0, core);
-  STATUS_CHECK(gdn.forward());
+  profiled_status("delta.gdn", [&] { return gdn.forward(); });
 
   // out = gated_rmsnorm(core, z) over v_head_dim, then out_proj.
   auto z = q35_buffer(Qwen35Buffer::kGdnZ);
-  STATUS_CHECK(l.in_proj_z->forward(normed, z));
+  profiled_status("matmul.gdn_z", [&] { return l.in_proj_z->forward(normed, z); });
   auto normed_core = q35_buffer(Qwen35Buffer::kGdnNormed);
   core.reshape({q35_.linear_num_v_heads, q35_.linear_v_head_dim});
   z.reshape({q35_.linear_num_v_heads, q35_.linear_v_head_dim});
   normed_core.reshape({q35_.linear_num_v_heads, q35_.linear_v_head_dim});
-  STATUS_CHECK(l.norm->forward(core, z, normed_core));
+  profiled_status("norm.gdn_output", [&] { return l.norm->forward(core, z, normed_core); });
   core.reshape({q35_.linear_v_dim});
   z.reshape({q35_.linear_v_dim});
   normed_core.reshape({q35_.linear_v_dim});
 
-  STATUS_CHECK(l.out_proj->forward(normed_core, get_buffer(ModelBufferType::kAttnOutput)));
+  profiled_status("matmul.gdn_out", [&] {
+    return l.out_proj->forward(normed_core, get_buffer(ModelBufferType::kAttnOutput));
+  });
 }
 
 void Qwen35Model::feed_forward(int32_t layer_idx, const tensor::Tensor& input) const {
-  STATUS_CHECK(layers_->add_layer_->forward(input, get_buffer(ModelBufferType::kAttnOutput),
-                                            input));
+  profiled_status("residual.attention", [&] {
+    return layers_->add_layer_->forward(input, get_buffer(ModelBufferType::kAttnOutput), input);
+  });
 
   auto ffn_norm = get_buffer(ModelBufferType::kFFNRMSNorm);
-  STATUS_CHECK(layers_->post_attn_norms_.at(layer_idx)->forward(input, ffn_norm));
+  profiled_status("norm.ffn", [&] {
+    return layers_->post_attn_norms_.at(layer_idx)->forward(input, ffn_norm);
+  });
 
   auto w1_out = get_buffer(ModelBufferType::kW1Output);
   auto w3_out = get_buffer(ModelBufferType::kW3Output);
-  STATUS_CHECK(layers_->w1_layers_.at(layer_idx)->forward(ffn_norm, w1_out));
-  STATUS_CHECK(layers_->w3_layers_.at(layer_idx)->forward(ffn_norm, w3_out));
-  STATUS_CHECK(layers_->swiglu_layer_->forward(w1_out, w3_out, w1_out));
+  profiled_status("matmul.mlp_gate", [&] {
+    return layers_->w1_layers_.at(layer_idx)->forward(ffn_norm, w1_out);
+  });
+  profiled_status("matmul.mlp_up", [&] {
+    return layers_->w3_layers_.at(layer_idx)->forward(ffn_norm, w3_out);
+  });
+  profiled_status("swiglu.mlp",
+                  [&] { return layers_->swiglu_layer_->forward(w1_out, w3_out, w1_out); });
 
   auto w2_out = get_buffer(ModelBufferType::kW2Output);
-  STATUS_CHECK(layers_->w2_layers_.at(layer_idx)->forward(w1_out, w2_out));
-  STATUS_CHECK(layers_->add_layer_->forward(input, w2_out, input));
+  profiled_status("matmul.mlp_down", [&] {
+    return layers_->w2_layers_.at(layer_idx)->forward(w1_out, w2_out);
+  });
+  profiled_status("residual.mlp",
+                  [&] { return layers_->add_layer_->forward(input, w2_out, input); });
 }
 
 void Qwen35Model::cls_logits(const tensor::Tensor& input) const {
-  STATUS_CHECK(layers_->final_norm_->forward(input, input));
-  STATUS_CHECK(
-      layers_->cls_layer_->forward(input, get_buffer(ModelBufferType::kForwardOutput)));
+  profiled_status("norm.final", [&] { return layers_->final_norm_->forward(input, input); });
+  profiled_status("matmul.lm_head", [&] {
+    return layers_->cls_layer_->forward(input, get_buffer(ModelBufferType::kForwardOutput));
+  });
 }
 
 base::Status Qwen35Model::forward(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
@@ -800,8 +891,14 @@ base::Status Qwen35Model::forward(const tensor::Tensor& input, const tensor::Ten
     return base::error::InvalidArgument("The input tensor is empty.");
   }
   for (int32_t i = 0; i < q35_.layer_num; ++i) {
-    STATUS_CHECK(layers_->input_norms_.at(i)->forward(
-        input, get_buffer(ModelBufferType::kOutputRMSNorm)));
+    char layer_range[48]{};
+    std::snprintf(layer_range, sizeof(layer_range), "layer_%02d/%s", i,
+                  q35_.layer_type(i) == Qwen35LayerType::kFullAttention ? "full" : "gdn");
+    base::ScopedNvtxRange range(layer_range);
+    profiled_status("norm.attention_input", [&] {
+      return layers_->input_norms_.at(i)->forward(
+          input, get_buffer(ModelBufferType::kOutputRMSNorm));
+    });
     if (q35_.layer_type(i) == Qwen35LayerType::kFullAttention) {
       attention_full(i, pos_tensor);
     } else {

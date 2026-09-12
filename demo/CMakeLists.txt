@@ -47,4 +47,38 @@ elseif (QWEN35_SUPPORT)
     target_link_libraries(qwen35_trace llama)
     target_link_libraries(qwen35_trace absl::base re2::re2 nlohmann_json::nlohmann_json)
     set_target_properties(qwen35_trace PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+    add_executable(qwen35_bench ../tools/benchmark_qwen35.cpp)
+    target_link_directories(qwen35_bench PUBLIC ${PROJECT_SOURCE_DIR}/lib)
+    target_link_libraries(qwen35_bench llama)
+    target_link_libraries(qwen35_bench absl::base re2::re2 nlohmann_json::nlohmann_json)
+    target_compile_definitions(qwen35_bench PRIVATE
+        KUIPER_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+        KUIPER_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}"
+    )
+    set_target_properties(qwen35_bench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    if(BUILD_TESTING)
+        add_test(
+            NAME qwen35_bench_smoke
+            COMMAND $<TARGET_FILE:qwen35_bench>
+                --mode matmul --device cpu --dtype bf16
+                --n 3 --m 64 --k 32 --matmul-implementation gemm
+                --warmup 0 --repeat 2
+        )
+        set_tests_properties(qwen35_bench_smoke PROPERTIES LABELS "benchmark;qwen35")
+        add_test(
+            NAME qwen35_gemv_loop_bench_smoke
+            COMMAND $<TARGET_FILE:qwen35_bench>
+                --mode matmul --device cpu --dtype bf16
+                --n 3 --m 64 --k 32 --matmul-implementation gemv-loop
+                --warmup 0 --repeat 2
+        )
+        set_tests_properties(qwen35_gemv_loop_bench_smoke PROPERTIES LABELS "benchmark;qwen35")
+        add_test(
+            NAME qwen35_gdn_bench_smoke
+            COMMAND $<TARGET_FILE:qwen35_bench>
+                --mode gdn --device cpu --warmup 0 --repeat 1
+        )
+        set_tests_properties(qwen35_gdn_bench_smoke PROPERTIES LABELS "benchmark;qwen35")
+    endif()
 endif ()
