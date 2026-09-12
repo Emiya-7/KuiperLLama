@@ -42,6 +42,8 @@ struct Options {
   std::string tokenizer;
   std::string output;
   std::string cache = "cold";
+  std::string matmul_implementation = "auto";
+  int32_t batch_size = 1;
   int32_t input_size = 2560;
   int32_t output_size = 4096;
   int32_t prompt_length = 12;
@@ -98,7 +100,7 @@ std::string current_git_commit() {
   std::cerr
       << "Usage:\n"
       << "  " << program
-      << " --mode matmul [--m 2560] [--k 4096] [--dtype bf16|fp32]\n"
+      << " --mode matmul [--n 1] [--m 2560] [--k 4096] [--dtype bf16|fp32]\n"
       << "  " << program
       << " --mode gdn [--device cuda|cpu]\n"
       << "  " << program
@@ -109,10 +111,11 @@ std::string current_git_commit() {
       << "  --repeat N              Timed workload repetitions (default: 5)\n"
       << "  --output FILE           Also write the JSON result to FILE\n"
       << "  --cache cold|warm       Matmul cache state (default: cold)\n"
+      << "  --matmul-implementation auto|gemm|gemv-loop (default: auto)\n"
       << "Model options:\n"
       << "  --prompt-length N       Deterministic synthetic prompt length (default: 12)\n"
       << "  --decode-steps N        Deterministic decode steps (default: 16)\n"
-      << "Matmul notation: input[M] * weight[K,M] -> output[K].\n";
+      << "Matmul notation: input[N,M] * weight[K,M]^T -> output[N,K].\n";
   std::exit(error.empty() ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
@@ -157,6 +160,10 @@ Options parse_options(int argc, char** argv) {
       options.output = value_after(i, arg);
     } else if (arg == "--cache") {
       options.cache = value_after(i, arg);
+    } else if (arg == "--matmul-implementation") {
+      options.matmul_implementation = value_after(i, arg);
+    } else if (arg == "--n") {
+      options.batch_size = parse_positive(value_after(i, arg), arg);
     } else if (arg == "--m") {
       options.input_size = parse_positive(value_after(i, arg), arg);
     } else if (arg == "--k") {
@@ -186,6 +193,27 @@ Options parse_options(int argc, char** argv) {
   }
   if (options.cache != "cold" && options.cache != "warm") {
     throw std::runtime_error("--cache must be cold or warm");
+  }
+  if (options.matmul_implementation != "auto" && options.matmul_implementation != "gemm" &&
+      options.matmul_implementation != "gemv-loop") {
+    throw std::runtime_error("--matmul-implementation must be auto, gemm, or gemv-loop");
+  }
+  const bool requests_gemm = options.matmul_implementation == "gemm" ||
+                             (options.matmul_implementation == "auto" &&
+                              options.batch_size > 1);
+  if (options.mode == "matmul" && requests_gemm && options.dtype != "bf16") {
+    throw std::runtime_error("the batched GEMM kernel currently requires --dtype bf16");
+  }
+  if (options.matmul_implementation != "auto" && options.matmul_implementation != "gemm" &&
+      options.matmul_implementation != "gemv-loop") {
+    throw std::runtime_error("--matmul-implementation must be auto, gemm, or gemv-loop");
+  }
+  if (options.mode == "matmul" && options.batch_size > 1 && options.dtype != "bf16") {
+    throw std::runtime_error("batched matmul currently requires --dtype bf16");
+  }
+  if (options.mode == "matmul" && options.matmul_implementation == "gemm" &&
+      options.batch_size == 1) {
+    throw std::runtime_error("--matmul-implementation gemm requires --n greater than 1");
   }
   if (options.mode != "matmul" && options.mode != "gdn" &&
       (options.checkpoint.empty() || options.tokenizer.empty())) {
@@ -411,9 +439,13 @@ ModelResults benchmark_model(const Options& options, base::DeviceType device) {
 
 struct MatmulResults {
   Stats elapsed;
+  std::string implementation;
   double checksum = 0.0;
   double gflops = 0.0;
   double effective_gbps = 0.0;
+  double estimated_memory_gbps = 0.0;
+  size_t logical_bytes = 0;
+  size_t estimated_memory_bytes = 0;
   size_t cache_flush_bytes = 0;
 };
 
@@ -578,9 +610,18 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   const auto cpu_alloc = base::CPUDeviceAllocatorFactory::get_instance();
   const base::DataType weight_type = options.dtype == "bf16" ? base::DataType::kDataTypeBf16
                                                               : base::DataType::kDataTypeFp32;
-  tensor::Tensor input(base::DataType::kDataTypeFp32, options.input_size, true, cpu_alloc);
+  const std::string implementation =
+      options.matmul_implementation == "auto"
+          ? (options.batch_size == 1 ? "gemv" : "gemm")
+          : options.matmul_implementation;
+  const bool use_batched_tensor = implementation == "gemm" || options.batch_size > 1;
+  const std::vector<int32_t> input_dims =
+      use_batched_tensor ? std::vector<int32_t>{options.batch_size, options.input_size}
+                         : std::vector<int32_t>{options.input_size};
+  tensor::Tensor input(base::DataType::kDataTypeFp32, input_dims, true, cpu_alloc);
   tensor::Tensor weight(weight_type, options.output_size, options.input_size, true, cpu_alloc);
-  for (int32_t i = 0; i < options.input_size; ++i) {
+  const int64_t input_elements = static_cast<int64_t>(options.batch_size) * options.input_size;
+  for (int64_t i = 0; i < input_elements; ++i) {
     input.index<float>(i) = static_cast<float>(i % 29 - 14) / 32.0f;
   }
   const int64_t weight_elements =
@@ -620,23 +661,50 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
     }
     check_cuda(cudaStreamSynchronize(cuda_config->stream), "synchronize matmul setup");
   }
-  tensor::Tensor output(base::DataType::kDataTypeFp32, options.output_size, true, output_alloc);
+  const std::vector<int32_t> output_dims =
+      use_batched_tensor ? std::vector<int32_t>{options.batch_size, options.output_size}
+                         : std::vector<int32_t>{options.output_size};
+  tensor::Tensor output(base::DataType::kDataTypeFp32, output_dims, true, output_alloc);
   op::MatmulLayer layer(device, options.output_size, options.input_size);
   layer.set_cuda_config(cuda_config);
   const base::Status weight_status = layer.set_weight(0, weight);
   if (!weight_status) {
     throw std::runtime_error("failed to bind matmul weight: " + weight_status.get_err_msg());
   }
-  const std::string range_name = "matmul/" + options.dtype + "/m" +
+  const std::string range_name = "matmul/" + implementation + "/" + options.dtype + "/n" +
+                                 std::to_string(options.batch_size) + "_m" +
                                  std::to_string(options.input_size) + "_k" +
                                  std::to_string(options.output_size);
+  std::vector<tensor::Tensor> input_rows;
+  std::vector<tensor::Tensor> output_rows;
+  if (implementation == "gemv-loop") {
+    input_rows.reserve(options.batch_size);
+    output_rows.reserve(options.batch_size);
+    for (int32_t row = 0; row < options.batch_size; ++row) {
+      input_rows.emplace_back(base::DataType::kDataTypeFp32, options.input_size, false, nullptr,
+                              input.ptr<float>(static_cast<int64_t>(row) * options.input_size));
+      output_rows.emplace_back(base::DataType::kDataTypeFp32, options.output_size, false, nullptr,
+                               output.ptr<float>(static_cast<int64_t>(row) * options.output_size));
+      input_rows.back().set_device_type(device);
+      output_rows.back().set_device_type(device);
+    }
+  }
   auto launch = [&] {
     // MatmulLayer::forward() hides Layer's convenience overloads, so dispatch
     // through the base type just as the model's shared_ptr<Layer> plumbing does.
     op::Layer& base_layer = layer;
-    const base::Status status = base_layer.forward(input, output);
-    if (!status) {
-      throw std::runtime_error("matmul failed: " + status.get_err_msg());
+    if (implementation == "gemv-loop") {
+      for (int32_t row = 0; row < options.batch_size; ++row) {
+        const base::Status status = base_layer.forward(input_rows[row], output_rows[row]);
+        if (!status) {
+          throw std::runtime_error("matmul GEMV loop failed: " + status.get_err_msg());
+        }
+      }
+    } else {
+      const base::Status status = base_layer.forward(input, output);
+      if (!status) {
+        throw std::runtime_error("matmul failed: " + status.get_err_msg());
+      }
     }
   };
   auto workload = [&] {
@@ -690,7 +758,10 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   }
   MatmulResults results;
   results.elapsed = summarize(samples);
-  for (int32_t i = 0; i < options.output_size; ++i) {
+  results.implementation = implementation;
+  const int64_t output_elements =
+      static_cast<int64_t>(options.batch_size) * options.output_size;
+  for (int64_t i = 0; i < output_elements; ++i) {
     results.checksum += output.index<float>(i);
   }
   if (cache_flush_buffer) {
@@ -698,11 +769,19 @@ MatmulResults benchmark_matmul(const Options& options, base::DeviceType device) 
   }
   results.cache_flush_bytes = options.cache == "cold" ? cache_scratch_bytes : 0;
   const double seconds = results.elapsed.median_ms / 1000.0;
-  results.gflops = 2.0 * options.input_size * options.output_size / seconds / 1e9;
-  const double bytes = static_cast<double>(options.input_size) * sizeof(float) +
-                       static_cast<double>(weight_elements) * base::DataTypeSize(weight_type) +
-                       static_cast<double>(options.output_size) * sizeof(float);
-  results.effective_gbps = bytes / seconds / 1e9;
+  results.gflops = 2.0 * options.batch_size * options.input_size * options.output_size / seconds /
+                   1e9;
+  results.logical_bytes = static_cast<size_t>(input_elements) * sizeof(float) +
+                          static_cast<size_t>(weight_elements) * base::DataTypeSize(weight_type) +
+                          static_cast<size_t>(output_elements) * sizeof(float);
+  results.estimated_memory_bytes =
+      static_cast<size_t>(input_elements) * sizeof(float) +
+      static_cast<size_t>(weight_elements) * base::DataTypeSize(weight_type) *
+          (implementation == "gemv-loop" ? options.batch_size : 1) +
+      static_cast<size_t>(output_elements) * sizeof(float);
+  results.effective_gbps = static_cast<double>(results.logical_bytes) / seconds / 1e9;
+  results.estimated_memory_gbps =
+      static_cast<double>(results.estimated_memory_bytes) / seconds / 1e9;
   return results;
 }
 
@@ -741,7 +820,7 @@ std::string result_json(const Options& options, const RuntimeInfo& runtime,
   std::ostringstream out;
   out << std::fixed << std::setprecision(6);
   out << "{\n"
-      << "  \"schema_version\": 1,\n"
+      << "  \"schema_version\": 2,\n"
       << "  \"git_commit\": \"" << json_escape(current_git_commit()) << "\",\n"
       << "  \"mode\": \"" << json_escape(options.mode) << "\",\n"
       << "  \"device\": \"" << json_escape(options.device) << "\",\n"
@@ -759,8 +838,10 @@ std::string result_json(const Options& options, const RuntimeInfo& runtime,
       << "  \"repeat\": " << options.repeat << ",\n";
   if (matmul) {
     out << "  \"matmul\": {\n"
+        << "    \"batch_size_n\": " << options.batch_size << ",\n"
         << "    \"input_size_m\": " << options.input_size << ",\n"
         << "    \"output_size_k\": " << options.output_size << ",\n"
+        << "    \"implementation\": \"" << matmul->implementation << "\",\n"
         << "    \"weight_dtype\": \"" << options.dtype << "\",\n"
         << "    \"cache\": \"" << options.cache << "\",\n"
         << "    \"cache_flush_bytes\": " << matmul->cache_flush_bytes << ",\n"
@@ -768,7 +849,10 @@ std::string result_json(const Options& options, const RuntimeInfo& runtime,
     write_stats(out, matmul->elapsed, 4);
     out << ",\n"
         << "    \"median_gflops\": " << matmul->gflops << ",\n"
+        << "    \"logical_bytes\": " << matmul->logical_bytes << ",\n"
+        << "    \"estimated_memory_bytes\": " << matmul->estimated_memory_bytes << ",\n"
         << "    \"median_effective_gbps\": " << matmul->effective_gbps << ",\n"
+        << "    \"median_estimated_memory_gbps\": " << matmul->estimated_memory_gbps << ",\n"
         << "    \"output_checksum\": " << matmul->checksum << "\n"
         << "  }\n";
   } else if (gdn) {

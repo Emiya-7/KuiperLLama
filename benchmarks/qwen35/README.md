@@ -6,7 +6,8 @@ GDN 的面试向瓶颈分析、逐轮优化计划和后续实测记录见
 
 BF16 线性层的 GEMV/GEMM 边界、三类瓶颈、逐轮实现与前后数据见
 [`BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md`](BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md)。
-当前 decode 是 GEMV；真正的 GEMM 将随并行 prefill 单独实现和测量。
+当前 decode 使用 GEMV；独立多 token GEMM 已可与 N 次 GEMV 在相同输入上对照，模型
+prefill 接入仍是后续工作。
 
 `qwen35_bench` is the reproducible timing harness used before and after CUDA
 kernel optimizations. It deliberately does not use `qwen35_trace`: trace mode
@@ -36,9 +37,11 @@ cmake --build build --target qwen35_bench -j2
 
 ## Matmul microbenchmark
 
-The notation is `input[M] * weight[K,M] -> output[K]`. The default shape is the
-Qwen3.5-4B `in_proj_z` matrix (`K=4096`, `M=2560`). Initialization and host to
-device copies are outside the timed region.
+The notation is `input[N,M] * weight[K,M]^T -> output[N,K]`. `N=1` selects the
+decode GEMV automatically. `N>1` selects the tiled GEMM; pass
+`--matmul-implementation gemv-loop` to run the same work as N independent GEMV
+launches. Initialization, tensor views, and host-to-device copies are outside
+the timed region.
 
 ```bash
 ./build/demo/qwen35_bench \
@@ -46,6 +49,23 @@ device copies are outside the timed region.
   --m 2560 --k 4096 --cache cold --warmup 5 --repeat 30 \
   --output /tmp/qwen35-matmul-baseline.json
 ```
+
+Compare one GEMM with the old token-by-token execution for a 32-token tile:
+
+```bash
+./build/demo/qwen35_bench \
+  --mode matmul --device cuda --dtype bf16 --n 32 --m 2560 --k 4096 \
+  --matmul-implementation gemv-loop --cache cold --warmup 5 --repeat 30
+
+./build/demo/qwen35_bench \
+  --mode matmul --device cuda --dtype bf16 --n 32 --m 2560 --k 4096 \
+  --matmul-implementation gemm --cache cold --warmup 5 --repeat 30
+```
+
+Both commands report task GFLOP/s and `logical_bytes`, which count the weight
+once. `estimated_memory_bytes` additionally models the GEMV loop as reading the
+weight N times; the corresponding bandwidth is diagnostic rather than a
+hardware-counter measurement. Use NCU for measured DRAM traffic.
 
 Matmul defaults to `--cache cold`: before each timed launch it touches a buffer
 twice the reported L2 size on the same stream, then records the start event.
@@ -63,6 +83,17 @@ benchmarks/qwen35/scripts/run_matmul_baseline.sh \
 
 Set `CACHE_MODES="cold warm"` only when collecting an explicitly separate cache
 study.
+
+Run the registered 4B prefill projection shapes for both implementations with:
+
+```bash
+benchmarks/qwen35/scripts/run_gemm_baseline.sh \
+  /tmp/qwen35-gemm-baseline 5 30
+```
+
+Use `IMPLEMENTATIONS=gemm` or `IMPLEMENTATIONS=gemv-loop` for a single side of
+the comparison. The default shape set covers N=8/32/128 and representative GDN
+and MLP projections.
 
 ## GDN microbenchmark
 

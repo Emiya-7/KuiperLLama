@@ -196,8 +196,9 @@ acc1 += x1 * w1
 | R2 | `00b03df` | BF16x2、双 accumulator、直接 CUB reduction | 56/56 + 真实 4B | 全 shape 三组 | 4 类 shape 三组 | 接受 256 threads |
 | R3 | R2 已完成 block 搜索 | 128/256/512 threads 对照 | 同 R2 | 256 通用最优 | 256 已测 | 接受 256 threads |
 | R4 | 待实验 | 小 K specialization 或 gate 融合 | 待测 | 待测 | 待测 | 待定 |
-| G0 | 本轮提交 | `[N,M]` 接口 + `16×16×32` tiled GEMM | 58/58 | 待建立 | 待建立 | 算子功能完成 |
-| G1 | 待实验 | GEMV-loop/cuBLAS/custom GEMM 基线与 tile 搜索 | 待测 | 待测 | 待测 | 尚未开始 |
+| G0 | `0dcc8d5` | `[N,M]` 接口 + `16×16×32` tiled GEMM | 58/58 | 待建立 | 待建立 | 算子功能完成 |
+| G1 | 本轮提交 | N 维 benchmark + GEMV-loop 公平对照 | 58/58，CTest 5/5 | 基准入口完成 | 待建立 | 测量基础设施完成 |
+| G2 | 待实验 | G0 基线、tile/register/vectorization 搜索 | 待测 | 待测 | 待测 | 尚未开始 |
 
 以后每轮在本文件追加实现映射、命令、原始报告目录、SHA-256 和结论；失败版本同样保留
 数据与原因。最终总结必须同时回答“为什么快”“在哪些 shape 快”“有没有数值或适用范围
@@ -392,3 +393,30 @@ G0 的 focused BF16 测试为 5/5，带自动 tiny fixture 的完整 GTest 为 5
 4/4。这一提交只确认接口、布局和数值正确，不在没有 GEMV-loop/cuBLAS 对照时宣称性能
 收益。下一步 G1 会给 benchmark 增加 N 维和实现选择，冻结不同 prompt tile 的基线后再
 搜索 tile、向量化和库实现。
+
+## 10. GEMM G1：可复现的 GEMM 与 GEMV-loop 对照入口
+
+G1 扩展 `qwen35_bench --mode matmul`，新增 `--n` 与
+`--matmul-implementation auto|gemm|gemv-loop`。`auto` 在 N=1 时走既有 GEMV，在 N>1
+时走 GEMM；显式 `gemv-loop` 则为每个 token 建立零拷贝的一维 tensor view，并在同一
+CUDA stream 内发出 N 次既有 GEMV。tensor view 和所有内存分配均在计时区间之外，因此
+对照测到的是“一个二维 kernel”与“N 个一维 kernel”的执行差异，不混入 host allocation。
+
+JSON schema 升级为 2，并记录 `batch_size_n`、实际 implementation、任务 GFLOP/s、
+logical bytes 和 estimated memory bytes。logical bytes 对两种实现都只计算一次 weight，
+适合表达完成同一数学任务的有效吞吐；estimated memory bytes 对 GEMV-loop 按 N 次完整
+weight 读取建模。后者只用于解释流量放大，真实 DRAM bytes 仍以 NCU counter 为准。
+
+固定 shape 表覆盖 `N=8/32/128` 的 `2560→4096` GDN projection，以及 N=32 的 GDN
+output、MLP up/down。`run_gemm_baseline.sh` 默认依次生成 GEMV-loop 与 GEMM 的 cold-cache
+JSON，避免只展示对自研 kernel 有利的单边结果。CPU CTest smoke 同时覆盖一次二维 GEMM
+和三次 GEMV-loop，CUDA 数值正确性继续由 G0 的非整 tile 单元测试负责。
+
+本轮仍然不记录“优化百分比”：G1 是测量基础设施。下一轮 G2 才会在相同命令、相同 shape
+和相同 cache policy 下冻结 G0 kernel 的数据，随后进行 tile/register/vectorization 搜索并
+用 NCU 解释接受或拒绝每个候选的原因。
+
+本机验证中，CPU `N=3,M=64,K=32` 的两条路径 checksum 均为 `0.647461`；CUDA
+`N=13,M=259,K=37`（三维均含 tail）的两条路径 checksum 均为 `0.347168`。完整 CTest
+为 5/5，内部 GTest 仍为 58/58。该小 CUDA shape 的单次观测只用于验证 harness 确实执行
+了不同路径，不作为正式性能结论。

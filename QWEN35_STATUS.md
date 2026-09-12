@@ -643,7 +643,8 @@ ctest --test-dir build --output-on-failure --timeout 300
 
 CTest 的 `qwen35_tiny_fixture` setup 会自动生成 safetensors、确定性 tokenizer 和 BF16
 checkpoint，再为 `test_llm` 设置路径；无需下载或复制真实 tokenizer。本机结果为 CTest
-`4/4 passed`（含 matmul/GDN benchmark smoke），内部 GTest `58/58 passed`，fixture
+`5/5 passed`（含 batched GEMM、GEMV-loop 和 GDN benchmark smoke），内部 GTest
+`58/58 passed`，fixture
 相关测试没有 skip。GitHub Actions 使用
 `self-hosted, linux, x64, gpu` runner 执行同一套 configure/build/ctest 命令；为避免不受信任
 的代码直接运行在自托管机器上，workflow 只响应仓库 push 和手动触发。当前仓库尚未注册

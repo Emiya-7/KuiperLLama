@@ -464,13 +464,14 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 调用 `cudaStreamDestroy` 后，`CudaConfig::~CudaConfig()` 又销毁同一 stream。测试中的
 手动销毁已经删除，现在由 `CudaConfig` 保持唯一所有权并负责析构清理。
 
-CTest 现在注册四个项目测试：`qwen35_tiny_fixture`、`test_llm`、CPU matmul benchmark
-smoke 和 CPU GDN benchmark smoke。fixture 无需下载外部模型，会生成 108 个张量的 tiny
+CTest 现在注册五个项目测试：`qwen35_tiny_fixture`、`test_llm`、CPU batched GEMM
+benchmark smoke、CPU GEMV-loop benchmark smoke 和 CPU GDN benchmark smoke。fixture
+无需下载外部模型，会生成 108 个张量的 tiny
 safetensors、保持真实 248070 有效 ID 边界的确定性 tokenizer，并导出约 66 MB 的 BF16
 checkpoint；`test_llm` 通过 `FIXTURES_REQUIRED` 自动获得模型和 tokenizer 路径。即使
 执行 `ctest -R '^test_llm$'`，CTest 也会自动补跑 setup。
 
-本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `58/58 passed`，fixture
+本机验证结果为 CTest `5/5 passed`，其中 `test_llm` 内部为 `58/58 passed`，fixture
 相关 tokenizer/CPU/CUDA 测试均实际执行，没有因环境变量缺失而 skip。
 
 `.github/workflows/qwen35-ci.yml` 在 `main`、`feat/**` push 和手动触发时，使用标签为

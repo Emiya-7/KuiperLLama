@@ -62,9 +62,18 @@ elseif (QWEN35_SUPPORT)
             NAME qwen35_bench_smoke
             COMMAND $<TARGET_FILE:qwen35_bench>
                 --mode matmul --device cpu --dtype bf16
-                --m 64 --k 32 --warmup 0 --repeat 2
+                --n 3 --m 64 --k 32 --matmul-implementation gemm
+                --warmup 0 --repeat 2
         )
         set_tests_properties(qwen35_bench_smoke PROPERTIES LABELS "benchmark;qwen35")
+        add_test(
+            NAME qwen35_gemv_loop_bench_smoke
+            COMMAND $<TARGET_FILE:qwen35_bench>
+                --mode matmul --device cpu --dtype bf16
+                --n 3 --m 64 --k 32 --matmul-implementation gemv-loop
+                --warmup 0 --repeat 2
+        )
+        set_tests_properties(qwen35_gemv_loop_bench_smoke PROPERTIES LABELS "benchmark;qwen35")
         add_test(
             NAME qwen35_gdn_bench_smoke
             COMMAND $<TARGET_FILE:qwen35_bench>
