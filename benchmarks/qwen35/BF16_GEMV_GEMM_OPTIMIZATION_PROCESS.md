@@ -197,8 +197,8 @@ acc1 += x1 * w1
 | R3 | R2 已完成 block 搜索 | 128/256/512 threads 对照 | 同 R2 | 256 通用最优 | 256 已测 | 接受 256 threads |
 | R4 | 待实验 | 小 K specialization 或 gate 融合 | 待测 | 待测 | 待测 | 待定 |
 | G0 | `0dcc8d5` | `[N,M]` 接口 + `16×16×32` tiled GEMM | 58/58 | 待建立 | 待建立 | 算子功能完成 |
-| G1 | 本轮提交 | N 维 benchmark + GEMV-loop 公平对照 | 58/58，CTest 5/5 | 基准入口完成 | 待建立 | 测量基础设施完成 |
-| G2 | 本轮提交 | N-aware tile + 每线程多输出 register tile | 58/58，CTest 5/5 | 全 shape 三组 | 提交后正式复测 | 接受 |
+| G1 | `c903be9` | N 维 benchmark + GEMV-loop 公平对照 | 58/58，CTest 5/5 | 基准入口完成 | 不适用 | 测量基础设施完成 |
+| G2 | `bae70ee` | N-aware tile + 每线程多输出 register tile | 58/58，CTest 5/5 | 全 shape 三组 | N=32/128 正式复测 | 接受 |
 
 以后每轮在本文件追加实现映射、命令、原始报告目录、SHA-256 和结论；失败版本同样保留
 数据与原因。最终总结必须同时回答“为什么快”“在哪些 shape 快”“有没有数值或适用范围
@@ -504,3 +504,47 @@ CTest 5/5、内部 GTest 58/58。正式 NCU 后测将在 G2 commit 上采集，�
 ├── 4b-stage4-gemm-g0-c903be9
 └── 4b-stage4-gemm-g2-regtile-run{1,2,3}
 ```
+
+### 11.5 提交后的正式 NCU 对照
+
+G2 commit `bae70ee6f19d5821b649821119a8cbf4373e2716` 上重新运行 NCU。N=32 可与
+G0 的同 shape、同 `detailed + SchedulerStats + WarpStateStats` 配置直接对比：
+
+| 指标 | G0 `c903be9` | G2 `bae70ee` | 变化 |
+|---|---:|---:|---:|
+| Duration | 530.496 us | 369.856 us | −30.3% |
+| Executed instructions | 61,849,600 | 38,593,536 | −37.6% |
+| Global-load SASS instructions | 1,310,720 | 655,360 | −50.0% |
+| Shared-load SASS instructions | 20,971,520 | 10,485,760 | −50.0% |
+| Shared-store SASS instructions | 1,310,720 | 655,360 | −50.0% |
+| Registers/thread | 40 | 40 | 不变 |
+| Local load / store | 0 / 0 | 0 / 0 | 无 spill |
+| Achieved occupancy | 77.72% | 33.60% | 下降 |
+| Waves/SM | 1.52 | 0.38 | block 总数下降 |
+| Eligible warps | 28.59% | 29.51% | 基本不变 |
+| Long scoreboard | 21.87% | 24.61% | 略升 |
+| DRAM read | 21.318 MB | 21.319 MB | 基本不变 |
+| L2 hit rate | 81.80% | 65.46% | 重复 tile load 减少后下降 |
+
+这个结果也说明不能把 occupancy 当作单一优化目标。G2 的 occupancy 和 waves 明显下降，
+但每个 block 完成的有效输出更多，global/shared 指令减半，总指令减少 37.6%，最终 duration
+下降 30.3%。G0 第二个 N tile 对 weight 的重复读取多从 L2 命中，因此 G2 的 DRAM read
+没有减半、L2 hit 反而降低；真正被消除的是 L2→SM、shared-memory 与控制指令层面的重复
+工作。40 registers 且无 local spill 证明 2×2 register tile 没有以寄存器溢出换速度。
+
+N=128 的 K=64/2×4 模板 NCU duration 为 `790.688 us`，SM throughput `81.54%`、DRAM
+throughput `7.44%` / `36.59 GB/s`、occupancy `54.72%`、eligible warps `38.54%`、long
+scoreboard `12.32%`、40 registers 且无 local spill。这里 NCU 多 pass replay 下的 duration
+高于独立 Event median `0.644096 ms`，性能百分比仍只使用不受 profiler 扰动的 Event 数据；
+NCU 用于解释资源和指令行为。
+
+正式报告目录与校验值：
+
+```text
+/home/tuesday/workspace/icd/profiles/KuiperLLama/qwen35/4b-stage4-gemm-after-bae70ee/
+```
+
+| Report | SHA-256 |
+|---|---|
+| `ncu-gdn-z-n32.ncu-rep` | `54183206527380059ecf8393bccb16fa345b3876e6e1bf37e07434c19fd1bbb2` |
+| `ncu-gdn-z-n128.ncu-rep` | `f31c85282f2627c6cd3f99ac978e6cc32c3e71d4363d039e34a9f7ab51244727` |
