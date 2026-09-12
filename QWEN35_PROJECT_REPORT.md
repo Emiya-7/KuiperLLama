@@ -455,8 +455,8 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 
 ### 6.6 测试状态
 
-测试二进制当前包含 55 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
-`55/55 passed`，包括 GDN 非零 state 16/128 步递推、`Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu`、
+测试二进制当前包含 56 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
+`56/56 passed`，包括 GDN 非零 state 16/128 步递推、`Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu`、
 `Qwen35Tiny.CudaMatchesCpu` 和真实 4B 投影尺寸的
 `test_matmul_bf16.qwen35_4b_projection_cuda_matches_cpu`。
 
@@ -470,7 +470,7 @@ safetensors、保持真实 248070 有效 ID 边界的确定性 tokenizer，并�
 checkpoint；`test_llm` 通过 `FIXTURES_REQUIRED` 自动获得模型和 tokenizer 路径。即使
 执行 `ctest -R '^test_llm$'`，CTest 也会自动补跑 setup。
 
-本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `55/55 passed`，fixture
+本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `56/56 passed`，fixture
 相关 tokenizer/CPU/CUDA 测试均实际执行，没有因环境变量缺失而 skip。
 
 `.github/workflows/qwen35-ci.yml` 在 `main`、`feat/**` push 和手动触发时，使用标签为

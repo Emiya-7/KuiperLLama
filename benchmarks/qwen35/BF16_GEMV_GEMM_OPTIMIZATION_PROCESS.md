@@ -4,7 +4,8 @@
 前后实测结果，供代码复盘和面试讲解使用。文中严格区分已经由 CUDA Event/NCU
 验证的事实与仍待实验的方案，不用理论带宽或单次最小值代替真实加速结果。
 
-当前状态：**GEMV 优化进行中，真正的多 token GEMM 尚未开始。** 当前 decode 和
+当前状态：**GEMV 优化进行中，真正的多 token GEMM 尚未开始。** R1 已修复 CUDA
+BF16 路径忽略 `scale` 的接口语义，并用奇数 M 覆盖后续向量化尾部。当前 decode 和
 token-by-token prefill 都只向 `MatmulLayer` 传入一个 FP32 activation vector，执行的是
 
 ```text
@@ -72,7 +73,7 @@ thread 0:
 3. 固定 128 threads，没有针对 `M=2560/4096/9216` 比较 block size；
 4. 先把每线程结果写入额外的 `sdata[128]`，再交给 CUB reduction，且 reduction 前后有
    多余同步；CUB 本身可以直接规约寄存器中的 `sum`；
-5. CUDA kernel 忽略接口传入的 `scale`，与 CPU 语义不一致；
+5. 优化前 CUDA kernel 忽略接口传入的 `scale`，与 CPU 语义不一致；R1 已修复；
 6. CUDA 接口声称接受最多二维 input，但只校验 `input.get_dim(0)==M`、只产出 K 个值，
    并未实现 CPU 路径的多列输入；当前 `MatmulLayer::check()` 也只接受长度 M 的单向量；
 7. 每行一个 block 对 K=32 只产生 32 blocks，不能填满 56-SM GPU；但盲目让一个 block
@@ -183,7 +184,7 @@ acc1 += x1 * w1
 | 轮次 | Commit | 变化 | 正确性 | Event | NCU | 结论 |
 |---|---|---|---|---|---|---|
 | R0 | `304eea3` | 128-thread 标量 BF16 GEMV | 4B 大投影通过 | 见基线文档 | 见第 4 节 | 优化前基线 |
-| R1 | 待提交 | scale + 奇数 M 护栏/修复 | 待测 | 不适用 | 不适用 | 正确性准备 |
+| R1 | 本轮提交 | scale + 奇数 M 护栏/修复 | focused/完整测试通过 | 不适用 | 不适用 | 已完成 |
 | R2 | 待实验 | BF16x2、双 accumulator、直接 CUB reduction | 待测 | 待测 | 待测 | 待定 |
 | R3 | 待实验 | block-size/shape dispatch | 待测 | 待测 | 待测 | 待定 |
 | R4 | 待实验 | 小 K specialization 或 gate 融合 | 待测 | 待测 | 待测 | 待定 |
@@ -192,3 +193,15 @@ acc1 += x1 * w1
 以后每轮在本文件追加实现映射、命令、原始报告目录、SHA-256 和结论；失败版本同样保留
 数据与原因。最终总结必须同时回答“为什么快”“在哪些 shape 快”“有没有数值或适用范围
 代价”，而不只给出一个最佳加速比。
+
+### 7.1 R1：补齐 scale 语义和奇数 M 护栏
+
+优化前 CPU BF16 kernel 在写输出时计算 `sum * scale`，CUDA BF16 kernel 却只写
+`sum`。Qwen3.5 的线性层固定传 1，所以模型 trace 无法发现该问题；直接使用公共
+kernel API（例如 attention 中的缩放 matmul）时会产生静默错误。
+
+R1 把 `scale` 传入 BF16 CUDA kernel 并在 reduction 后由 thread 0 应用，同时增加
+`M=259, K=37, scale=-0.375` 的 CPU/CUDA 对照。奇数 M 不是为了当前 4B shape，而是
+提前保护 R2 的 BF16x2 快路径：向量循环必须只覆盖完整 pair，最后一个元素仍要正确
+参与累加。focused BF16 测试 3/3、完整 GTest 56/56（由 CTest fixture 提供 tiny
+模型环境）和 CTest 4/4 均通过。该轮不改变 scale=1 的 4B 性能路径，因而不采性能数据。

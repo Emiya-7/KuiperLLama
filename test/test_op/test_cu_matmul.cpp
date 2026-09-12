@@ -91,6 +91,65 @@ TEST(test_matmul_bf16, qwen35_4b_projection_cuda_matches_cpu) {
       << "max|cpu-cuda|=" << max_abs << ", |reference|max=" << reference_scale;
 }
 
+TEST(test_matmul_bf16, cuda_applies_scale_and_handles_odd_input_size) {
+  int device_count = 0;
+  const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+  if (device_status != cudaSuccess || device_count == 0) {
+    cudaGetLastError();
+    GTEST_SKIP() << "CUDA device unavailable";
+  }
+
+  // An odd M protects the scalar tail needed by the later BF16x2 fast path.
+  constexpr int32_t kInputSize = 259;
+  constexpr int32_t kOutputSize = 37;
+  constexpr float kScale = -0.375f;
+  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+  auto alloc_cuda = base::CUDADeviceAllocatorFactory::get_instance();
+  tensor::Tensor input_cpu(base::DataType::kDataTypeFp32, kInputSize, true, alloc_cpu);
+  tensor::Tensor weight_cpu(base::DataType::kDataTypeBf16, kOutputSize, kInputSize, true,
+                            alloc_cpu);
+  tensor::Tensor output_cpu(base::DataType::kDataTypeFp32, kOutputSize, true, alloc_cpu);
+
+  for (int32_t column = 0; column < kInputSize; ++column) {
+    input_cpu.index<float>(column) = static_cast<float>(column % 23 - 11) / 16.f;
+  }
+  for (int32_t row = 0; row < kOutputSize; ++row) {
+    for (int32_t column = 0; column < kInputSize; ++column) {
+      const int32_t pattern = (row * 19 + column * 7) % 29 - 14;
+      weight_cpu.index<uint16_t>(static_cast<int64_t>(row) * kInputSize + column) =
+          base::float_to_bfloat16(static_cast<float>(pattern) / 32.f);
+    }
+  }
+  matmul_kernel_cpu(input_cpu, weight_cpu, output_cpu, kScale);
+
+  tensor::Tensor input_cuda = input_cpu.clone();
+  tensor::Tensor weight_cuda = weight_cpu.clone();
+  input_cuda.to_cuda();
+  weight_cuda.to_cuda();
+  tensor::Tensor output_cuda(base::DataType::kDataTypeFp32, kOutputSize, true, alloc_cuda);
+
+  CudaConfig config;
+  ASSERT_EQ(cudaStreamCreate(&config.stream), cudaSuccess);
+  get_matmul_kernel(base::DeviceType::kDeviceCUDA)(input_cuda, weight_cuda, output_cuda, kScale,
+                                                    &config);
+  ASSERT_EQ(cudaStreamSynchronize(config.stream), cudaSuccess);
+  output_cuda.to_cpu();
+  ASSERT_EQ(cudaStreamDestroy(config.stream), cudaSuccess);
+  config.stream = nullptr;
+
+  double max_abs = 0.0;
+  double reference_scale = 0.0;
+  for (int32_t row = 0; row < kOutputSize; ++row) {
+    const double expected = output_cpu.index<float>(row);
+    const double actual = output_cuda.index<float>(row);
+    ASSERT_TRUE(std::isfinite(actual)) << "row=" << row;
+    max_abs = std::max(max_abs, std::abs(actual - expected));
+    reference_scale = std::max(reference_scale, std::abs(expected));
+  }
+  EXPECT_LT(max_abs / std::max(reference_scale, 1e-6), 2e-5)
+      << "max|cpu-cuda|=" << max_abs << ", |reference|max=" << reference_scale;
+}
+
 TEST(test_matmul_cu, matmul_linear_stream5) {
   auto alloc_cu = base::CUDADeviceAllocatorFactory::get_instance();
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
