@@ -4,8 +4,10 @@
 前后实测结果，供代码复盘和面试讲解使用。文中严格区分已经由 CUDA Event/NCU
 验证的事实与仍待实验的方案，不用理论带宽或单次最小值代替真实加速结果。
 
-当前状态：**GEMV 优化进行中，真正的多 token GEMM 尚未开始。** R1 已修复 CUDA
-BF16 路径忽略 `scale` 的接口语义，并用奇数 M 覆盖后续向量化尾部。当前 decode 和
+当前状态：**GEMV R2 已实现，真正的多 token GEMM 尚未开始。** R1 修复了 CUDA
+BF16 路径忽略 `scale` 的接口语义，并用奇数 M 覆盖向量化尾部；R2 为偶数 M 增加
+BF16x2/FP32x2 成对读取、双 accumulator、直接 CUB reduction，并通过 128/256/512
+threads 实测选择 256。当前 decode 和
 token-by-token prefill 都只向 `MatmulLayer` 传入一个 FP32 activation vector，执行的是
 
 ```text
@@ -184,9 +186,9 @@ acc1 += x1 * w1
 | 轮次 | Commit | 变化 | 正确性 | Event | NCU | 结论 |
 |---|---|---|---|---|---|---|
 | R0 | `304eea3` | 128-thread 标量 BF16 GEMV | 4B 大投影通过 | 见基线文档 | 见第 4 节 | 优化前基线 |
-| R1 | 本轮提交 | scale + 奇数 M 护栏/修复 | focused/完整测试通过 | 不适用 | 不适用 | 已完成 |
-| R2 | 待实验 | BF16x2、双 accumulator、直接 CUB reduction | 待测 | 待测 | 待测 | 待定 |
-| R3 | 待实验 | block-size/shape dispatch | 待测 | 待测 | 待测 | 待定 |
+| R1 | `cf66f5e` | scale + 奇数 M 护栏/修复 | focused/完整测试通过 | 不适用 | 不适用 | 已完成 |
+| R2 | 本轮提交 | BF16x2、双 accumulator、直接 CUB reduction | 3/3 focused | 全 shape 已测 | 4 类 shape 已测 | 接受 256 threads |
+| R3 | R2 已完成 block 搜索 | 128/256/512 threads 对照 | 同 R2 | 256 通用最优 | 256 已测 | 接受 256 threads |
 | R4 | 待实验 | 小 K specialization 或 gate 融合 | 待测 | 待测 | 待测 | 待定 |
 | R5 | prefill 后 | 真正的多 token GEMM | 待测 | 待测 | 待测 | 尚未开始 |
 
@@ -205,3 +207,68 @@ R1 把 `scale` 传入 BF16 CUDA kernel 并在 reduction 后由 thread 0 应用�
 提前保护 R2 的 BF16x2 快路径：向量循环必须只覆盖完整 pair，最后一个元素仍要正确
 参与累加。focused BF16 测试 3/3、完整 GTest 56/56（由 CTest fixture 提供 tiny
 模型环境）和 CTest 4/4 均通过。该轮不改变 scale=1 的 4B 性能路径，因而不采性能数据。
+
+### 7.2 R2：BF16x2、双累加器和 block-size 搜索
+
+R2 对偶数 M 走专用 fast path。线程每次用 `float2` 读取两个 FP32 activation，用
+`__nv_bfloat162` 读取两个 BF16 weight，再由 `__bfloat1622float2` 转成 FP32；两路
+FMA 分别累加到 `sum0/sum1`，循环结束后合并。奇数 M 继续走 R1 验证过的 scalar
+fallback。两条路径都不再先把 partial sum 写入 `sdata[thread]`，而是把寄存器值直接交给
+`cub::BlockReduce`，因此删除了额外 shared-memory round trip 和多余同步。
+
+这里的关键安全条件是：CUDA allocator 保证 tensor 基地址对齐；只有 M 为偶数时每一行
+BF16 weight 的起点才始终满足 `__nv_bfloat162` 的 4-byte alignment，所以 dispatch
+不能只在 kernel 内简单处理一个奇数 tail。4B 的所有真实 M 都为偶数，能进入 fast path。
+
+block-size 探索使用 cold cache、20 warmup、200 samples。下表列代表 shape；单位均为
+微秒。p95 在 WSL 下仍有离散调度尖峰，因此 block 选择以全 shape median 和 NCU 为主。
+
+| Shape | R1 scalar/128 | BF16x2/128 | BF16x2/256 | BF16x2/512 | 选择 |
+|---|---:|---:|---:|---:|---|
+| gate `32×2560` | 6.144 | 6.144 | 5.120 | 5.120 | 256；512 无新增收益 |
+| full K/V `1024×2560` | 21.504 | 21.504 | 20.480 | 22.528–22.656 | 256 |
+| GDN out `2560×4096` | 67.584 | 66.560 | 66.560 | 66.560 | 256；避免其他 shape 退化 |
+| GDN QKV `8192×2560` | 129.024 | 129.024 | 128.000 | 135.168 | 256 |
+| MLP up `9216×2560` | 143.376 | 143.360 | 143.360 | 148.480 | 256 |
+| MLP down `2560×9216` | 148.480 | 143.360 | 144.384 | 143.360 | 128 略快但差距小，先用通用 256 |
+| LM head `248320×2560` | 3595.264 | 3638.272 | 3570.688 | 3569.664 | 256；512 收益可忽略且中型退化 |
+
+256 相对同一时段 R1 的 median：gate 降 16.7%，`1024×2560` 降 4.8%，中型投影约降
+0.8%–1.5%，MLP down 降 2.8%，LM head 降 0.7%。这不是一个大幅降低权重流量的
+优化：BF16 weight 仍必须完整读取一次，因此越接近 DRAM 上限的 shape，收益越小。
+
+首轮 NCU 使用和 R0 相同的 `detailed + SchedulerStats + WarpStateStats`、kernel replay 和
+cache control。结果为：
+
+| Shape | R0 duration | R2/256 duration | 改善 | R0 global ld | R2 global ld | R2 registers | local ld/st |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| gate | 3.776 us | 3.360 us | 11.0% | 5,120 | 2,560 | 37 | 0 / 0 |
+| GDN out | 59.680 us | 56.800 us | 4.8% | 655,360 | 327,680 | 37 | 0 / 0 |
+| MLP down | 140.896 us | 133.984 us | 4.9% | 1,474,560 | 737,280 | 37 | 0 / 0 |
+| LM head | 4009.280 us | 3971.936 us | 0.9% | 39,731,200 | 19,865,600 | 37 | 0 / 0 |
+
+global-load SASS 指令恰好减半，证明 BF16x2/FP32x2 load 确实生成了预期的成对访问；
+registers 仍为 37 且无 spill。256 threads 也把 gate 的 achieved occupancy 从 8.07%
+提高到 14.58%、eligible 从 4.09% 提高到 8.30%；LM head 的 eligible 从 14.24%
+提高到 21.94%。代价是更多线程参与边界判断和 CUB reduction，总指令并未下降：例如
+GDN out 从 2,426,880 增到 2,836,480，LM head 从 179,783,680 增到 271,165,440。
+最终仍有小幅加速，说明减少 load 指令并增加可调度 warp 的收益覆盖了控制/reduction
+开销，但它也解释了为什么大带宽 shape 只有个位数百分比提升。
+
+512 threads 在 LM head 上只比 256 快 0.03%，却让 QKV 慢 5.6%、MLP up 慢 3.6%，
+所以拒绝。128 threads 对 MLP down 有约 0.7% 优势，但 LM head 退化 1.2%，其余 shape
+收益更弱；当前先保留一个 256-thread 通用 fast path，只有重复 NCU 证明 M-based dispatch
+能稳定覆盖成本时才增加分派复杂度。
+
+探索报告目录（源码尚未提交时，JSON 内嵌 commit 仍显示 R1，目录名才是实验身份）：
+
+```text
+/home/tuesday/workspace/icd/profiles/KuiperLLama/qwen35/
+├── 4b-stage2-gemv-r1-cf66f5e/cuda-events
+├── 4b-stage2-gemv-r2-bf16x2-128/cuda-events
+├── 4b-stage2-gemv-r2-bf16x2-256/{cuda-events,ncu}
+└── 4b-stage2-gemv-r2-bf16x2-512/cuda-events
+```
+
+R2 提交后还需重建 benchmark 并采三次正式 NCU，使报告的 Git commit 与源码一致；正式
+哈希和重复结果将在下一次文档提交补齐。

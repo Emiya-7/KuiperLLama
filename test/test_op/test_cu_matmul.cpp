@@ -46,6 +46,7 @@ TEST(test_matmul_bf16, qwen35_4b_projection_cuda_matches_cpu) {
   // million BF16 weights instead of only validating a toy matrix.
   constexpr int32_t kInputSize = 2560;
   constexpr int32_t kOutputSize = 4096;
+  constexpr float kScale = -0.375f;
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
   auto alloc_cuda = base::CUDADeviceAllocatorFactory::get_instance();
   tensor::Tensor input_cpu(base::DataType::kDataTypeFp32, kInputSize, true, alloc_cpu);
@@ -63,7 +64,7 @@ TEST(test_matmul_bf16, qwen35_4b_projection_cuda_matches_cpu) {
           base::float_to_bfloat16(static_cast<float>(pattern) / 64.f);
     }
   }
-  matmul_kernel_cpu(input_cpu, weight_cpu, output_cpu);
+  matmul_kernel_cpu(input_cpu, weight_cpu, output_cpu, kScale);
 
   tensor::Tensor input_cuda = input_cpu.clone();
   tensor::Tensor weight_cuda = weight_cpu.clone();
@@ -73,7 +74,7 @@ TEST(test_matmul_bf16, qwen35_4b_projection_cuda_matches_cpu) {
 
   CudaConfig config;
   ASSERT_EQ(cudaStreamCreate(&config.stream), cudaSuccess);
-  get_matmul_kernel(base::DeviceType::kDeviceCUDA)(input_cuda, weight_cuda, output_cuda, 1.f,
+  get_matmul_kernel(base::DeviceType::kDeviceCUDA)(input_cuda, weight_cuda, output_cuda, kScale,
                                                     &config);
   ASSERT_EQ(cudaStreamSynchronize(config.stream), cudaSuccess);
   output_cuda.to_cpu();
