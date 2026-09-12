@@ -19,6 +19,9 @@ GEMV/MatMul 做优化前后对照。9B 独立 `lm_head`、INT8 暂停，长 prom
 仍未实现。GDN 已完成 512-block 二维 tile 和 state 单读优化，三次正式 NCU 为
 2.47–2.69×；完整过程见
 [`benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md)。
+BF16 线性层已进入优化阶段；decode GEMV 与后续并行 prefill GEMM 的边界、基线指标和
+分轮计划见
+[`benchmarks/qwen35/BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md)。
 
 ---
 

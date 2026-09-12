@@ -4,6 +4,10 @@ GDN 的面试向瓶颈分析、逐轮优化计划和后续实测记录见
 [`GDN_OPTIMIZATION_PROCESS.md`](GDN_OPTIMIZATION_PROCESS.md)。该文档会随每次 GDN
 优化同步更新，并明确区分已测结果与待验证假设。
 
+BF16 线性层的 GEMV/GEMM 边界、三类瓶颈、逐轮实现与前后数据见
+[`BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md`](BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md)。
+当前 decode 是 GEMV；真正的 GEMM 将随并行 prefill 单独实现和测量。
+
 `qwen35_bench` is the reproducible timing harness used before and after CUDA
 kernel optimizations. It deliberately does not use `qwen35_trace`: trace mode
 synchronizes and copies every selected hidden state, which changes the workload.

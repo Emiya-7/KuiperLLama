@@ -705,5 +705,6 @@ GDN 的独立面试讲解、瓶颈证据、分轮实验和最终前后结果持�
 | [`tools/verify_qwen35/`](tools/verify_qwen35/) | Kuiper/HF trace 和比较工具 |
 | [`benchmarks/qwen35/BASELINE_4B.md`](benchmarks/qwen35/BASELINE_4B.md) | 4B 核心算子性能基线与 NCU 对照规则 |
 | [`benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/GDN_OPTIMIZATION_PROCESS.md) | GDN 面试讲解、优化实验与前后结果档案 |
+| [`benchmarks/qwen35/BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md) | BF16 GEMV/GEMM 瓶颈、实现与前后实验档案 |
 | [`kuiper/source/model/qwen35.cpp`](kuiper/source/model/qwen35.cpp) | 模型加载、buffer、forward、状态管理 |
 | [`kuiper/source/op/kernels/cuda/qwen35_kernel.cu`](kuiper/source/op/kernels/cuda/qwen35_kernel.cu) | Qwen3.5 CUDA kernel |
