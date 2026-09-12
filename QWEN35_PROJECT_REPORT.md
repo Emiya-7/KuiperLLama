@@ -455,8 +455,8 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 
 ### 6.6 测试状态
 
-测试二进制当前包含 56 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
-`56/56 passed`，包括 GDN 非零 state 16/128 步递推、`Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu`、
+测试二进制当前包含 58 项。带 tiny fixture、在 RTX 4070 SUPER 上运行的结果为
+`58/58 passed`，包括 GDN 非零 state 16/128 步递推、`Qwen35ZeroCenteredRMSNorm.CudaMatchesCpu`、
 `Qwen35Tiny.CudaMatchesCpu` 和真实 4B 投影尺寸的
 `test_matmul_bf16.qwen35_4b_projection_cuda_matches_cpu`。
 
@@ -470,7 +470,7 @@ safetensors、保持真实 248070 有效 ID 边界的确定性 tokenizer，并�
 checkpoint；`test_llm` 通过 `FIXTURES_REQUIRED` 自动获得模型和 tokenizer 路径。即使
 执行 `ctest -R '^test_llm$'`，CTest 也会自动补跑 setup。
 
-本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `56/56 passed`，fixture
+本机验证结果为 CTest `4/4 passed`，其中 `test_llm` 内部为 `58/58 passed`，fixture
 相关 tokenizer/CPU/CUDA 测试均实际执行，没有因环境变量缺失而 skip。
 
 `.github/workflows/qwen35-ci.yml` 在 `main`、`feat/**` push 和手动触发时，使用标签为
@@ -673,8 +673,9 @@ ctest --test-dir build --output-on-failure --timeout 300
    128/256/512-thread 搜索；最终采用 256 threads。global-load 指令减半，正式 NCU
    中 gate、GDN out、MLP down 的中位 duration 分别改善 16.9%、10.6%、5.7%；
    `lm_head` 波动跨过基线，后续仍需单独 specialization。
-4. 实现分块/并行 prefill。届时输入从单向量扩展到多 token 矩阵，建立真正的 GEMM
-   基线并单独做 Tensor Core/cuBLASLt 或自研 tiled kernel 对比。
+4. **GEMM G0 已完成**：`MatmulLayer` 已定义 token-major `[N,M]×[K,M]^T→[N,K]`
+   BF16 批量接口，CUDA 初版为 `16×16×32` shared-memory tiled kernel。下一步建立
+   GEMV-loop/cuBLAS/custom 基线、做 tile 优化，再接入分块/并行 prefill。
 
 本阶段只使用 Nsight Compute 做核心算子分析，不进行 Nsight Systems 时间线或整程序
 调度优化。9B、INT8 与 9B 独立 `lm_head` 真实权重验证因内存空间不足暂缓，不纳入当前

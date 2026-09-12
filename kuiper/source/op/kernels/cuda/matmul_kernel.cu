@@ -109,6 +109,58 @@ __global__ void matmul_kernel_cu_fp32bf16x2(const float* input, const __nv_bfloa
   }
 }
 
+template <int TILE_N, int TILE_K, int TILE_M>
+__global__ void matmul_kernel_cu_fp32bf16_gemm(const float* input,
+                                               const __nv_bfloat16* weight, float* output, int N,
+                                               int M, int K, float scale) {
+  // Padding the reduction dimension avoids a shared-memory bank conflict when
+  // adjacent threads consume different weight rows at the same M coordinate.
+  __shared__ float input_tile[TILE_N][TILE_M + 1];
+  __shared__ float weight_tile[TILE_K][TILE_M + 1];
+
+  const int local_k = threadIdx.x;
+  const int local_n = threadIdx.y;
+  const int output_k = blockIdx.x * TILE_K + local_k;
+  const int output_n = blockIdx.y * TILE_N + local_n;
+  const int linear_tid = local_n * TILE_K + local_k;
+  constexpr int THREADS = TILE_N * TILE_K;
+  float sum = 0.f;
+
+  for (int m_start = 0; m_start < M; m_start += TILE_M) {
+    for (int index = linear_tid; index < TILE_N * TILE_M; index += THREADS) {
+      const int tile_n = index / TILE_M;
+      const int tile_m = index % TILE_M;
+      const int global_n = blockIdx.y * TILE_N + tile_n;
+      const int global_m = m_start + tile_m;
+      input_tile[tile_n][tile_m] =
+          global_n < N && global_m < M
+              ? input[static_cast<size_t>(global_n) * M + global_m]
+              : 0.f;
+    }
+    for (int index = linear_tid; index < TILE_K * TILE_M; index += THREADS) {
+      const int tile_k = index / TILE_M;
+      const int tile_m = index % TILE_M;
+      const int global_k = blockIdx.x * TILE_K + tile_k;
+      const int global_m = m_start + tile_m;
+      weight_tile[tile_k][tile_m] =
+          global_k < K && global_m < M
+              ? __bfloat162float(weight[static_cast<size_t>(global_k) * M + global_m])
+              : 0.f;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int tile_m = 0; tile_m < TILE_M; ++tile_m) {
+      sum = fmaf(input_tile[local_n][tile_m], weight_tile[local_k][tile_m], sum);
+    }
+    __syncthreads();
+  }
+
+  if (output_n < N && output_k < K) {
+    output[static_cast<size_t>(output_n) * K + output_k] = sum * scale;
+  }
+}
+
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
 __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weight,
                                           const float* scales, const int32_t group_size,
@@ -152,10 +204,25 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   const int32_t K = weight.get_dim(0);  // row
   const int32_t M = weight.get_dim(1);  // col
 
-  CHECK_EQ(M, input.get_dim(0));
+  CHECK(output.is_empty() == false);
+  CHECK(output.device_type() == base::DeviceType::kDeviceCUDA);
+  const bool batched = input.dims_size() == 2;
+  const int32_t N = batched ? input.get_dim(0) : 1;
+  CHECK_EQ(M, batched ? input.get_dim(1) : input.get_dim(0));
+  CHECK_EQ(output.size(), static_cast<size_t>(N) * K);
   cudaStream_t stream = config ? config->stream : nullptr;
   if (weight.data_type() == base::DataType::kDataTypeBf16) {
-    if (M % 2 == 0) {
+    if (batched) {
+      constexpr int TILE_N = 16;
+      constexpr int TILE_K = 16;
+      constexpr int TILE_M = 32;
+      const dim3 block(TILE_K, TILE_N);
+      const dim3 grid((K + TILE_K - 1) / TILE_K, (N + TILE_N - 1) / TILE_N);
+      matmul_kernel_cu_fp32bf16_gemm<TILE_N, TILE_K, TILE_M><<<grid, block, 0, stream>>>(
+          input.ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>()),
+          const_cast<float*>(output.ptr<float>()), N, M, K, scale);
+      check_cuda_kernel_launch("matmul_kernel_cu_fp32bf16_gemm");
+    } else if (M % 2 == 0) {
       matmul_kernel_cu_fp32bf16x2<256><<<K, 256, 0, stream>>>(
           input.ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>()),
           const_cast<float*>(output.ptr<float>()), M, K, scale);
@@ -168,6 +235,7 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
     }
   } else {
     CHECK(weight.data_type() == base::DataType::kDataTypeFp32);
+    CHECK(!batched) << "Batched CUDA Matmul currently requires BF16 weights.";
     matmul_kernel_cu_fp32<128, 1><<<K, 128, 0, stream>>>(
         input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K);
     check_cuda_kernel_launch("matmul_kernel_cu_fp32");

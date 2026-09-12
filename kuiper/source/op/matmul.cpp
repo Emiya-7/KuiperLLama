@@ -17,10 +17,22 @@ MatmulLayer::MatmulLayer(base::DeviceType device_type, int32_t dim0, int32_t dim
 }
 
 base::Status MatmulLayer::check() const {
-  auto status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim1_);
+  const auto& input = get_input(0);
+  auto status = check_tensor(input, device_type_, data_type_);
   if (!status) {
     LOG(ERROR) << "The input tensor error in the matmul layer.";
     return status;
+  }
+  if (input.dims_size() != 1 && input.dims_size() != 2) {
+    return base::error::InvalidArgument("Matmul input must be [M] or [N,M].");
+  }
+  const bool batched = input.dims_size() == 2;
+  const int32_t input_dim = batched ? input.get_dim(1) : input.get_dim(0);
+  if (input_dim != dim1_) {
+    return base::error::InvalidArgument("Matmul input's final dimension must match the weight.");
+  }
+  if (batched && has_bias_) {
+    return base::error::InvalidArgument("Batched Matmul bias broadcasting is not implemented.");
   }
 
   if (!is_quant_layer_) {
@@ -43,6 +55,11 @@ base::Status MatmulLayer::check() const {
     }
   }
 
+  if (batched &&
+      (is_quant_layer_ || get_weight(0).data_type() != base::DataType::kDataTypeBf16)) {
+    return base::error::InvalidArgument("Batched Matmul currently requires BF16 weights.");
+  }
+
   if (is_quant_layer_) {
     status = check_tensor_with_dim(scales_, device_type_, base::DataType::kDataTypeFp32, scales_.size());
     if (!status) {
@@ -51,7 +68,12 @@ base::Status MatmulLayer::check() const {
     }
   }
 
-  status = check_tensor_with_dim(get_output(0), device_type_, data_type_, dim0_);
+  if (batched) {
+    status = check_tensor_with_dim(get_output(0), device_type_, data_type_, input.get_dim(0),
+                                   dim0_);
+  } else {
+    status = check_tensor_with_dim(get_output(0), device_type_, data_type_, dim0_);
+  }
   if (!status) {
     LOG(ERROR) << "The output tensor error in the matmul layer.";
     return status;

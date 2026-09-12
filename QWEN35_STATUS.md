@@ -8,9 +8,9 @@
 上与 Transformers FP32/eager 逐层对齐；Qwen3.5-4B 的真实 BF16 权重也已完成
 导出、Kuiper 端到端推理和 Transformers BF16 参考比较，覆盖了 4B 特有的 GDN
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
-8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 56 个 GTest；RTX 4070
+8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 58 个 GTest；RTX 4070
 SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测试结果为
-56/56 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
+58/58 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
 分别与 Kuiper CPU、Transformers BF16 对齐。详细结果见
 [`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 
@@ -25,6 +25,9 @@ BF16 线性层已进入优化阶段；decode GEMV 与后续并行 prefill GEMM �
 第一轮 BF16x2/256-thread GEMV 已完成：global-load 指令减半，正式 NCU 中 gate、GDN
 out、MLP down 的中位 duration 分别改善 16.9%、10.6%、5.7%；LM head 波动跨过基线，
 只记录为尚未证实的微小收益。真实 4B trace 的 10 个 token 保持完全一致。
+GEMM 阶段已完成 G0：`MatmulLayer` 支持 token-major `[N,M]×[K,M]^T→[N,K]` BF16
+批量路径，CUDA 使用 `16×16×32` shared-memory tiled kernel；模型 prefill 接入和正式
+GEMM 性能基线仍在后续阶段。
 
 ---
 
@@ -313,7 +316,7 @@ max|diff| = 1.68e-08    ref absmax = 4.94e-02    相对误差 = 3.39e-07
 - 非零 weight 的 `(1+w)` 参考值及 CPU in-place 路径
 - CUDA 对 CPU（无 CUDA 设备时 skip）
 
-当前共定义 56 个 GTest，已在 RTX 4070 SUPER 上全部通过，包括 Qwen3.5 tiny 的
+当前共定义 58 个 GTest，已在 RTX 4070 SUPER 上全部通过，包括 Qwen3.5 tiny 的
 CPU/CUDA 端到端对齐、Tensor BF16 存储/转换、BF16 matmul 和 BF16 embedding。
 
 ### 4.6 真实 Qwen3.5-0.8B 对 Transformers（阶段 3）
@@ -640,7 +643,7 @@ ctest --test-dir build --output-on-failure --timeout 300
 
 CTest 的 `qwen35_tiny_fixture` setup 会自动生成 safetensors、确定性 tokenizer 和 BF16
 checkpoint，再为 `test_llm` 设置路径；无需下载或复制真实 tokenizer。本机结果为 CTest
-`4/4 passed`（含 matmul/GDN benchmark smoke），内部 GTest `56/56 passed`，fixture
+`4/4 passed`（含 matmul/GDN benchmark smoke），内部 GTest `58/58 passed`，fixture
 相关测试没有 skip。GitHub Actions 使用
 `self-hosted, linux, x64, gpu` runner 执行同一套 configure/build/ctest 命令；为避免不受信任
 的代码直接运行在自托管机器上，workflow 只响应仓库 push 和手动触发。当前仓库尚未注册

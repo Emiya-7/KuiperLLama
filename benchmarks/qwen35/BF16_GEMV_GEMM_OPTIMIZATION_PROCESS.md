@@ -4,11 +4,13 @@
 前后实测结果，供代码复盘和面试讲解使用。文中严格区分已经由 CUDA Event/NCU
 验证的事实与仍待实验的方案，不用理论带宽或单次最小值代替真实加速结果。
 
-当前状态：**GEMV R2 已完成并正式验证，真正的多 token GEMM 尚未开始。** R1 修复了 CUDA
+当前状态：**GEMV R2 已完成并正式验证，GEMM G0 已完成算子接口和初版 tiled kernel。**
+R1 修复了 CUDA
 BF16 路径忽略 `scale` 的接口语义，并用奇数 M 覆盖向量化尾部；R2 为偶数 M 增加
 BF16x2/FP32x2 成对读取、双 accumulator、直接 CUB reduction，并通过 128/256/512
-threads 实测选择 256。当前 decode 和
-token-by-token prefill 都只向 `MatmulLayer` 传入一个 FP32 activation vector，执行的是
+threads 实测选择 256。G0 定义了 token-major `input[N,M] × weight[K,M]^T →
+output[N,K]`，但模型 prefill 尚未接入，当前 decode 和 token-by-token prefill 仍只向
+`MatmulLayer` 传入一个 FP32 activation vector，执行的是
 
 ```text
 x[M] * W[K, M]^T -> y[K]
@@ -194,7 +196,8 @@ acc1 += x1 * w1
 | R2 | `00b03df` | BF16x2、双 accumulator、直接 CUB reduction | 56/56 + 真实 4B | 全 shape 三组 | 4 类 shape 三组 | 接受 256 threads |
 | R3 | R2 已完成 block 搜索 | 128/256/512 threads 对照 | 同 R2 | 256 通用最优 | 256 已测 | 接受 256 threads |
 | R4 | 待实验 | 小 K specialization 或 gate 融合 | 待测 | 待测 | 待测 | 待定 |
-| R5 | prefill 后 | 真正的多 token GEMM | 待测 | 待测 | 待测 | 尚未开始 |
+| G0 | 本轮提交 | `[N,M]` 接口 + `16×16×32` tiled GEMM | 58/58 | 待建立 | 待建立 | 算子功能完成 |
+| G1 | 待实验 | GEMV-loop/cuBLAS/custom GEMM 基线与 tile 搜索 | 待测 | 待测 | 待测 | 尚未开始 |
 
 以后每轮在本文件追加实现映射、命令、原始报告目录、SHA-256 和结论；失败版本同样保留
 数据与原因。最终总结必须同时回答“为什么快”“在哪些 shape 快”“有没有数值或适用范围
@@ -346,3 +349,46 @@ bandwidth-bound。下一轮优先级为：
    API 的正确性；
 3. 不在 N=1 GEMV 上强行使用 Tensor Core；先实现并行 prefill 接口，再开始多 token
    GEMM、cuBLASLt baseline 和自研 tiled kernel 对照。
+
+## 9. GEMM G0：二维接口和初版 tiled kernel
+
+G0 先解决“框架名为 Matmul，但只有单向量路径”的功能缺口。新的公共布局为：
+
+```text
+input  [N,M] FP32，token-major，单个 token 的 M 个元素连续
+weight [K,M] BF16，输出行优先
+output [N,K] FP32，token-major
+```
+
+选择 token-major 而不是沿用旧 CPU kernel 未被调用过的 `[M,N]` 解释，有两个原因：
+
+1. `EmbeddingLayer` 本来就产生 `[tokens, hidden]`，未来 prefill 不需要额外转置；
+2. 可以把同一输入按 token 切成 N 个连续 `[M]` 向量，建立 N 次 GEMV 与一次 GEMM 的
+   公平对照。
+
+`MatmulLayer::check()` 现在分别检查 `[M]→[K]` 和 `[N,M]→[N,K]`，二维路径当前明确
+只接受 BF16 weight；INT8、FP32 weight 和 bias broadcast 暂不假装支持，而是返回错误。
+CPU BF16/FP32 实现也统一成 token-major 语义。仓库中没有旧的二维调用者，因此这项
+布局修正不会改变已有模型路径。
+
+初版 CUDA kernel 使用 `TILE_N=16, TILE_K=16, TILE_M=32`：
+
+```text
+grid.x = ceil(K / 16)
+grid.y = ceil(N / 16)
+block  = (16,16) = 256 threads
+
+每个 M tile：
+  协作加载 16×32 FP32 activation 到 shared memory
+  协作加载并转换 16×32 BF16 weight 到 FP32 shared memory
+  每个线程计算一个 output[n,k] 的 32 次 FMA
+```
+
+shared tile 的 reduction 维增加一个 padding column，避免同一 warp 在不同 K row、相同
+M coordinate 上读取 weight 时形成 32-way bank conflict。N、K、M 均通过边界判断支持
+非 tile 整倍数；测试特意使用 `N=13, K=37, M=259` 覆盖三种 tail。
+
+G0 的 focused BF16 测试为 5/5，带自动 tiny fixture 的完整 GTest 为 58/58，CTest 为
+4/4。这一提交只确认接口、布局和数值正确，不在没有 GEMV-loop/cuBLAS 对照时宣称性能
+收益。下一步 G1 会给 benchmark 增加 N 维和实现选择，冻结不同 prompt tile 的基线后再
+搜索 tile、向量化和库实现。
