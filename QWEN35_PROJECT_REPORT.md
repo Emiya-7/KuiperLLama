@@ -460,6 +460,12 @@ hidden、final norm 和 logits 观测点同步。trace 的 `metadata.json` 会�
 `Qwen35Tiny.CudaMatchesCpu` 和真实 4B 投影尺寸的
 `test_matmul_bf16.qwen35_4b_projection_cuda_matches_cpu`。
 
+阶段 4 已建立 token-major `[N,M]×[K,M]^T→[N,K]` BF16 GEMM，并将初版
+`16×16×32` one-output-per-thread kernel 优化为按 N 分派的 register-tiled kernel。CUDA
+Event 三组复测中，Qwen3.5-4B GDN z projection 的 N=32/128 median 相对初版分别下降
+约 29%/63%；完整候选、拒绝原因与 NCU 指标记录在
+`benchmarks/qwen35/BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md`。
+
 此前 RMSNorm CUDA 测试会在完成数值断言后发生 SIGSEGV。cuda-gdb 定位到测试手动
 调用 `cudaStreamDestroy` 后，`CudaConfig::~CudaConfig()` 又销毁同一 stream。测试中的
 手动销毁已经删除，现在由 `CudaConfig` 保持唯一所有权并负责析构清理。

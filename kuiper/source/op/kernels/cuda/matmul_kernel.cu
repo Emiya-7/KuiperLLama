@@ -109,22 +109,24 @@ __global__ void matmul_kernel_cu_fp32bf16x2(const float* input, const __nv_bfloa
   }
 }
 
-template <int TILE_N, int TILE_K, int TILE_M>
-__global__ void matmul_kernel_cu_fp32bf16_gemm(const float* input,
-                                               const __nv_bfloat16* weight, float* output, int N,
-                                               int M, int K, float scale) {
+template <int TILE_N, int TILE_K, int TILE_M, int OUTPUTS_N, int OUTPUTS_K>
+__global__ void matmul_kernel_cu_fp32bf16_gemm_regtile(
+    const float* input, const __nv_bfloat16* weight, float* output, int N, int M, int K,
+    float scale) {
+  static_assert(TILE_N % OUTPUTS_N == 0 && TILE_K % OUTPUTS_K == 0,
+                "Each output tile must divide evenly across its threads.");
   // Padding the reduction dimension avoids a shared-memory bank conflict when
   // adjacent threads consume different weight rows at the same M coordinate.
   __shared__ float input_tile[TILE_N][TILE_M + 1];
   __shared__ float weight_tile[TILE_K][TILE_M + 1];
 
-  const int local_k = threadIdx.x;
-  const int local_n = threadIdx.y;
-  const int output_k = blockIdx.x * TILE_K + local_k;
-  const int output_n = blockIdx.y * TILE_N + local_n;
-  const int linear_tid = local_n * TILE_K + local_k;
-  constexpr int THREADS = TILE_N * TILE_K;
-  float sum = 0.f;
+  constexpr int THREADS_K = TILE_K / OUTPUTS_K;
+  constexpr int THREADS_N = TILE_N / OUTPUTS_N;
+  constexpr int THREADS = THREADS_N * THREADS_K;
+  const int local_k = threadIdx.x * OUTPUTS_K;
+  const int local_n = threadIdx.y * OUTPUTS_N;
+  const int linear_tid = threadIdx.y * THREADS_K + threadIdx.x;
+  float sums[OUTPUTS_N][OUTPUTS_K] = {};
 
   for (int m_start = 0; m_start < M; m_start += TILE_M) {
     for (int index = linear_tid; index < TILE_N * TILE_M; index += THREADS) {
@@ -151,14 +153,43 @@ __global__ void matmul_kernel_cu_fp32bf16_gemm(const float* input,
 
 #pragma unroll
     for (int tile_m = 0; tile_m < TILE_M; ++tile_m) {
-      sum = fmaf(input_tile[local_n][tile_m], weight_tile[local_k][tile_m], sum);
+#pragma unroll
+      for (int output_n = 0; output_n < OUTPUTS_N; ++output_n) {
+        const float input_value = input_tile[local_n + output_n][tile_m];
+#pragma unroll
+        for (int output_k = 0; output_k < OUTPUTS_K; ++output_k) {
+          sums[output_n][output_k] =
+              fmaf(input_value, weight_tile[local_k + output_k][tile_m],
+                   sums[output_n][output_k]);
+        }
+      }
     }
     __syncthreads();
   }
 
-  if (output_n < N && output_k < K) {
-    output[static_cast<size_t>(output_n) * K + output_k] = sum * scale;
+#pragma unroll
+  for (int result_n = 0; result_n < OUTPUTS_N; ++result_n) {
+    const int output_n = blockIdx.y * TILE_N + local_n + result_n;
+#pragma unroll
+    for (int result_k = 0; result_k < OUTPUTS_K; ++result_k) {
+      const int output_k = blockIdx.x * TILE_K + local_k + result_k;
+      if (output_n < N && output_k < K) {
+        output[static_cast<size_t>(output_n) * K + output_k] =
+            sums[result_n][result_k] * scale;
+      }
+    }
   }
+}
+
+template <int TILE_N, int OUTPUTS_N, int TILE_K, int OUTPUTS_K>
+void launch_matmul_kernel_cu_fp32bf16_gemm(const float* input,
+                                           const __nv_bfloat16* weight, float* output, int N,
+                                           int M, int K, float scale, cudaStream_t stream) {
+  constexpr int TILE_M = 32;
+  const dim3 block(TILE_K / OUTPUTS_K, TILE_N / OUTPUTS_N);
+  const dim3 grid((K + TILE_K - 1) / TILE_K, (N + TILE_N - 1) / TILE_N);
+  matmul_kernel_cu_fp32bf16_gemm_regtile<TILE_N, TILE_K, TILE_M, OUTPUTS_N, OUTPUTS_K>
+      <<<grid, block, 0, stream>>>(input, weight, output, N, M, K, scale);
 }
 
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
@@ -213,15 +244,26 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   cudaStream_t stream = config ? config->stream : nullptr;
   if (weight.data_type() == base::DataType::kDataTypeBf16) {
     if (batched) {
-      constexpr int TILE_N = 16;
-      constexpr int TILE_K = 16;
-      constexpr int TILE_M = 32;
-      const dim3 block(TILE_K, TILE_N);
-      const dim3 grid((K + TILE_K - 1) / TILE_K, (N + TILE_N - 1) / TILE_N);
-      matmul_kernel_cu_fp32bf16_gemm<TILE_N, TILE_K, TILE_M><<<grid, block, 0, stream>>>(
-          input.ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>()),
-          const_cast<float*>(output.ptr<float>()), N, M, K, scale);
-      check_cuda_kernel_launch("matmul_kernel_cu_fp32bf16_gemm");
+      const auto* weight_ptr =
+          reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>());
+      if (N <= 8) {
+        launch_matmul_kernel_cu_fp32bf16_gemm<8, 1, 32, 2>(
+            input.ptr<float>(), weight_ptr, const_cast<float*>(output.ptr<float>()), N, M, K,
+            scale, stream);
+      } else if (N <= 16) {
+        launch_matmul_kernel_cu_fp32bf16_gemm<16, 1, 32, 2>(
+            input.ptr<float>(), weight_ptr, const_cast<float*>(output.ptr<float>()), N, M, K,
+            scale, stream);
+      } else if (N <= 32) {
+        launch_matmul_kernel_cu_fp32bf16_gemm<32, 2, 32, 2>(
+            input.ptr<float>(), weight_ptr, const_cast<float*>(output.ptr<float>()), N, M, K,
+            scale, stream);
+      } else {
+        launch_matmul_kernel_cu_fp32bf16_gemm<32, 2, 64, 4>(
+            input.ptr<float>(), weight_ptr, const_cast<float*>(output.ptr<float>()), N, M, K,
+            scale, stream);
+      }
+      check_cuda_kernel_launch("matmul_kernel_cu_fp32bf16_gemm_regtile");
     } else if (M % 2 == 0) {
       matmul_kernel_cu_fp32bf16x2<256><<<K, 256, 0, stream>>>(
           input.ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(weight.ptr<uint16_t>()),

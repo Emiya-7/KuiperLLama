@@ -10,7 +10,9 @@
 v:k=2:1 分组。两种模型的前 10 个 greedy token 均完全一致。4B checkpoint 为
 8.41 GB，Kuiper CPU 运行峰值内存约 8.0 GiB。当前共定义 58 个 GTest；RTX 4070
 SUPER 上真实 4B CUDA 推理和 tiny CPU/CUDA 对齐均已跑通，完整测试结果为
-58/58 passed；真实 4B CUDA 的逐层 hidden、final norm、完整 logits 和生成 token 也已
+58/58 passed；多 token BF16 GEMM 已加入按 N 分派的 register tiling，代表性 N=32/128
+GDN projection 相对初版 tiled kernel 分别提升约 29%/63%；真实 4B CUDA 的逐层 hidden、
+final norm、完整 logits 和生成 token 也已
 分别与 Kuiper CPU、Transformers BF16 对齐。详细结果见
 [`QWEN35_PROJECT_REPORT.md`](QWEN35_PROJECT_REPORT.md)。
 

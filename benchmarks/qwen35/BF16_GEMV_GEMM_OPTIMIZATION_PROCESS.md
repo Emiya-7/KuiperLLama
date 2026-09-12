@@ -198,7 +198,7 @@ acc1 += x1 * w1
 | R4 | 待实验 | 小 K specialization 或 gate 融合 | 待测 | 待测 | 待测 | 待定 |
 | G0 | `0dcc8d5` | `[N,M]` 接口 + `16×16×32` tiled GEMM | 58/58 | 待建立 | 待建立 | 算子功能完成 |
 | G1 | 本轮提交 | N 维 benchmark + GEMV-loop 公平对照 | 58/58，CTest 5/5 | 基准入口完成 | 待建立 | 测量基础设施完成 |
-| G2 | 待实验 | G0 基线、tile/register/vectorization 搜索 | 待测 | 待测 | 待测 | 尚未开始 |
+| G2 | 本轮提交 | N-aware tile + 每线程多输出 register tile | 58/58，CTest 5/5 | 全 shape 三组 | 提交后正式复测 | 接受 |
 
 以后每轮在本文件追加实现映射、命令、原始报告目录、SHA-256 和结论；失败版本同样保留
 数据与原因。最终总结必须同时回答“为什么快”“在哪些 shape 快”“有没有数值或适用范围
@@ -420,3 +420,87 @@ JSON，避免只展示对自研 kernel 有利的单边结果。CPU CTest smoke �
 `N=13,M=259,K=37`（三维均含 tail）的两条路径 checksum 均为 `0.347168`。完整 CTest
 为 5/5，内部 GTest 仍为 58/58。该小 CUDA shape 的单次观测只用于验证 harness 确实执行
 了不同路径，不作为正式性能结论。
+
+## 11. GEMM G2：register tiling 与按 N 分派
+
+### 11.1 G0 性能和 NCU 暴露的问题
+
+在 commit `c903be9` 上使用 cold cache、5 warmup、30 samples 冻结 G0。下表把一次
+`16×16×32` GEMM 与同一输入的 N 次 R2 GEMV 并列；单位为毫秒：
+
+| Shape | GEMV-loop | G0 GEMM | G0 相对 loop | 结论 |
+|---|---:|---:|---:|---|
+| GDN z，N=8，M=2560，K=4096 | 0.173056 | 0.248848 | 慢 43.8% | 小 N 无法摊薄 tile/同步成本 |
+| GDN z，N=32 | 0.592384 | 0.433152 | 快 26.9% | 已有 weight reuse，但计算核心低效 |
+| GDN z，N=128 | 2.730560 | 1.733088 | 快 36.5% | GEMM 方向正确，仍有较大优化空间 |
+| GDN out，N=32，M=4096，K=2560 | 0.397936 | 0.381952 | 快 4.0% | 初版只取得边缘收益 |
+| MLP up，N=32，M=2560，K=9216 | 1.007104 | 0.777216 | 快 22.8% | K 大时 block 数足够 |
+| MLP down，N=32，M=9216，K=2560 | 0.985088 | 0.974848 | 快 1.0% | 长 reduction 的串行依赖明显 |
+
+G0 的 N=32 GDN z NCU baseline 为：duration `530.496 us`、SM throughput `80.30%`、
+DRAM throughput 仅 `10.75%` / `52.82 GB/s`、L2 hit `81.80%`、achieved occupancy
+`77.72%`、40 registers/thread、eligible warps `28.59%`、long scoreboard `21.87%`。
+这组指标说明瓶颈不是“DRAM 已打满”：G0 需要两个 N tile，同一 weight 的第二次加载大量
+命中 L2；同时每线程只有一个 accumulator，长 FMA dependency chain 使高 occupancy 没有
+转化成高 issue efficiency。因此 G2 的首要目标是增加单线程独立输出、减少 block 与重复
+tile load，而不是继续堆线程数。
+
+### 11.2 接受的实现
+
+G2 仍保持 FP32 activation × BF16 weight、FP32 accumulation/output，不为使用 Tensor Core
+而把 activation 静默降成 BF16。每个线程改为计算多个 output：
+
+| N 区间 | tile `N×K×M` | 每线程输出 | block threads | 设计原因 |
+|---|---:|---:|---:|---|
+| N≤8 | `8×32×32` | `1×2` | 128 | 避免 G0 中无效 N row，保留足够 warps |
+| 9–16 | `16×32×32` | `1×2` | 256 | 覆盖 prompt tail，K 方向提供两个独立 accumulator |
+| 17–32 | `32×32×32` | `2×2` | 256 | 一个 block 覆盖完整 N=32，weight 只加载一次 |
+| N>32 | `32×64×32` | `2×4` | 256 | 大 N 可摊薄 8 accumulators，进一步降低 block 数 |
+
+以 N=32 为例，G0 的 block 数为 `(4096/16)×(32/16)=512`；G2 降为
+`(4096/32)×(32/32)=128`。每线程的四个独立 accumulator 同时增加 instruction-level
+parallelism，缩短单 accumulator dependency chain；N=128 的 K=64 版本则让每线程计算
+八个输出。shared-memory padding 和 M/K/N tail guard 保留。
+
+### 11.3 被拒绝的候选
+
+1. 对所有 N 使用 K=64、每线程四个 K 输出：N=128 从 K=32 候选的 `0.803840 ms`
+   降到 `0.645632 ms`，但 N=32 从 `0.306176 ms` 退化到 `0.359424 ms`，N=8 从
+   `0.215040 ms` 退化到 `0.313344 ms`。因此只在 N>32 使用。
+2. N=8 使用 64 threads、每线程四个 K 输出得到 `0.289792 ms`，少量 warps 无法隐藏
+   shared/global latency，拒绝。
+3. 沿 M 把每个输出拆成四个 accumulator，N=8 得到 `0.247808 ms`，比单 accumulator
+   register-tile 的 `0.215040 ms` 慢；N=32 没有改善。额外寄存器与最终 reduction 没有被
+   dependency 缩短收益覆盖，已从源码移除。
+
+### 11.4 CUDA Event 三组复测
+
+最终候选使用 cold cache、每组 5 warmup + 30 samples。表中为三组 median，百分比使用
+三组中位数与 G0 比较：
+
+| Shape | G0 | G2 run1 / run2 / run3 | 三组中位数改善 |
+|---|---:|---:|---:|
+| GDN z N=8 | 0.248848 | 0.212992 / 0.212992 / 0.200704 | 14.4% |
+| GDN z N=32 | 0.433152 | 0.307136 / 0.306176 / 0.274432 | 29.3% |
+| GDN z N=128 | 1.733088 | 0.645632 / 0.644096 / 0.566272 | 62.8% |
+| GDN out N=32 | 0.381952 | 0.369664 / 0.369680 / 0.332800 | 3.2% |
+| MLP up N=32 | 0.777216 | 0.528896 / 0.528928 / 0.530416 | 31.9% |
+| MLP down N=32 | 0.974848 | 1.030656 / 0.848384 / 0.835584 | 13.0% |
+
+MLP down 的 run1 比 G0 慢 5.7%，而后两组快 13%–14%；该 shape 暂记为“有收益但存在
+跨 run 波动”，不把最好一次包装成稳定结论。N=8 虽较 G0 改善，仍慢于 N 次 GEMV，说明
+小 prompt 的后续策略应是 operator 内部 GEMV fallback 或更适合小 M/N 的专用 kernel，
+不能声称当前 GEMM 已覆盖所有 batch 区间。
+
+正确性测试在同一个 GTest 中使用 N=7/13/23/35 覆盖四个实际模板族，并用 M=259、K=37
+覆盖 reduction/output tail；每组都与 CPU BF16-weight/FP32-accumulation 参考比较。完整
+CTest 5/5、内部 GTest 58/58。正式 NCU 后测将在 G2 commit 上采集，以确保报告内嵌 commit
+与最终 kernel 一致。
+
+原始 Event 目录：
+
+```text
+/home/tuesday/workspace/icd/profiles/KuiperLLama/qwen35/
+├── 4b-stage4-gemm-g0-c903be9
+└── 4b-stage4-gemm-g2-regtile-run{1,2,3}
+```
