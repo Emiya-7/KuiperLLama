@@ -4,12 +4,13 @@
 前后实测结果，供代码复盘和面试讲解使用。文中严格区分已经由 CUDA Event/NCU
 验证的事实与仍待实验的方案，不用理论带宽或单次最小值代替真实加速结果。
 
-当前状态：**GEMV R2 已完成并正式验证，GEMM G0 已完成算子接口和初版 tiled kernel。**
+当前状态：**GEMV R2 与 GEMM G2 均已完成独立算子优化和正式验证。**
 R1 修复了 CUDA
 BF16 路径忽略 `scale` 的接口语义，并用奇数 M 覆盖向量化尾部；R2 为偶数 M 增加
 BF16x2/FP32x2 成对读取、双 accumulator、直接 CUB reduction，并通过 128/256/512
 threads 实测选择 256。G0 定义了 token-major `input[N,M] × weight[K,M]^T →
-output[N,K]`，但模型 prefill 尚未接入，当前 decode 和 token-by-token prefill 仍只向
+output[N,K]`，G2 已加入按 N 分派的 register tiling；但模型 prefill 尚未接入，当前
+decode 和 token-by-token prefill 仍只向
 `MatmulLayer` 传入一个 FP32 activation vector，执行的是
 
 ```text
@@ -37,6 +38,14 @@ x[M] * W[K, M]^T -> y[K]
 > 4B 的逐层误差和 10 个 token 均通过。LM head 的 Event/NCU 波动跨过基线，所以只记录
 > 为未证实的微小收益，并留作独立 specialization。真正多 token prefill 完成后，再以
 > cuBLASLt 作为可靠基准并评估 Tensor Core tiled GEMM。
+
+GEMM 部分可以接着讲：初版每线程只算一个输出，N=32 的 NCU 虽有 77.72% occupancy，
+但只有 28.59% eligible warps，且重复 N tile 产生大量 L2/shared load。于是把 block 从
+16×16 输出扩成 32×32/32×64，并让每线程保留 2×2 或 2×4 个独立 accumulator；再按 N
+选择 tile，避免小 batch 被过宽 tile 拖慢。N=32 的 global/shared load 均减半、总指令
+减少 37.6%、无 spill，NCU duration 下降 30.3%；独立 Event 上 N=128 下降 62.8%。这也
+是一个“occupancy 下降但 kernel 更快”的例子，因为优化目标是有效工作量与数据复用，
+不是孤立地追求 occupancy 数字。
 
 ## 2. 优化对象与 4B 代表形状
 
@@ -340,7 +349,7 @@ logits 为 `2.60097e-06`；10 个 greedy token 完全一致。相对 R2 前 CUDA
 | 2 | `0ccfe5d459b88577d6c42ccea2f117d82451c7db07f9f4aa37429ed6dfb28641` | `3dfdd6d36803b98838de2a8fb24232caa33ec1b9c62c681c707be1558d1fa88c` | `211f7d6d43ed692eb845b77e60a829b2389f779b966c2f7c705c89e4546bf938` | `174ea19a8b6fedbe9fb1b5137681ceb51cf0fa71a70cce9f44169ab8cbd00266` |
 | 3 | `ed2faa2c998d19275f6cedd7e6abd8b77ef950f3e99b989bacb47784b714eb87` | `e80a64d5dbadce9a03b41a718b499258bb24a40343246b21203eecb2a9b882ab` | `485c97c2a1871bb5a51a7346d27d2e9c1029c5f0a64fe829af9d91567ad49245` | `0d58f845e63aa2e55fe437624826ca5bcf0437977aed4cdc397ae1da9371a5c6` |
 
-## 8. 下一步
+## 8. GEMV R2 完成时确定的后续路线（历史）
 
 R2 已经拿到“指令级向量化 + block 并行度”的第一轮收益，但大投影仍然是 weight
 bandwidth-bound。下一轮优先级为：
@@ -548,3 +557,21 @@ NCU 用于解释资源和指令行为。
 |---|---|
 | `ncu-gdn-z-n32.ncu-rep` | `54183206527380059ecf8393bccb16fa345b3876e6e1bf37e07434c19fd1bbb2` |
 | `ncu-gdn-z-n128.ncu-rep` | `f31c85282f2627c6cd3f99ac978e6cc32c3e71d4363d039e34a9f7ab51244727` |
+
+## 12. GEMM 当前边界与后续工作
+
+本轮完成的是可独立运行、可用 NCU 分析的 BF16-weight GEMM 算子，不等于模型已经拥有
+并行 prefill。当前仍需后续完成：
+
+1. N≤8 的 G2 GEMM 虽比 G0 快 14.4%，仍慢于 N 次成熟 GEMV；需要明确的小 N fallback
+   或专用 kernel，并在 benchmark JSON 中暴露实际策略。
+2. 将 embedding 后的 `[tokens,hidden]` 沿 projection/MLP 传递到二维 Matmul；GDN 的
+   recurrent state update 和 causal attention 仍必须保持时序/因果语义，不能只把线性层
+   改成二维就宣称 prefill 完成。
+3. 当前二维路径只支持 BF16 weight、无 bias broadcast；FP32、INT8/量化与 bias 要么实现
+   完整语义和测试，要么继续显式拒绝。
+4. cuBLAS/cuBLASLt 对照必须保持同一语义：当前是 FP32 activation、BF16 weight、FP32
+   accumulation/output。若库路径要求先把 activation 降为 BF16，或把 weight 扩为 FP32，
+   就分别改变了数值语义或 4B 显存占用，不能与本轮 kernel 混写成公平加速比。后续先验证
+   mixed-type 支持组合，再决定采用库 baseline 还是单独标注的 BF16-activation Tensor Core
+   实验。
