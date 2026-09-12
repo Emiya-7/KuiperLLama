@@ -669,8 +669,10 @@ ctest --test-dir build --output-on-failure --timeout 300
    SchedulerStats、WarpStateStats、原始 CSV、报告哈希和未插桩 CUDA Event 延迟。
 2. **已完成**：根据 NCU 的 occupancy、warp stall 和指令数据优化 4B GDN；最终采用
    512-block 二维 tile 和 state 寄存器复用，正式 NCU 为 2.47–2.69×。
-3. 优化 BF16 GEMV；按大投影、小输出投影和 `lm_head` 三种负载分别判断，避免只在
-   单一形状上得出结论。
+3. **已完成第一轮**：BF16x2/FP32x2 成对读取、双 accumulator、直接 CUB reduction 和
+   128/256/512-thread 搜索；最终采用 256 threads。global-load 指令减半，正式 NCU
+   中 gate、GDN out、MLP down 的中位 duration 分别改善 16.9%、10.6%、5.7%；
+   `lm_head` 波动跨过基线，后续仍需单独 specialization。
 4. 实现分块/并行 prefill。届时输入从单向量扩展到多 token 矩阵，建立真正的 GEMM
    基线并单独做 Tensor Core/cuBLASLt 或自研 tiled kernel 对比。
 

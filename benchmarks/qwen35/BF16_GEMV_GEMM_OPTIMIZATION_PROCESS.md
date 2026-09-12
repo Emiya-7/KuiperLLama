@@ -4,7 +4,7 @@
 前后实测结果，供代码复盘和面试讲解使用。文中严格区分已经由 CUDA Event/NCU
 验证的事实与仍待实验的方案，不用理论带宽或单次最小值代替真实加速结果。
 
-当前状态：**GEMV R2 已实现，真正的多 token GEMM 尚未开始。** R1 修复了 CUDA
+当前状态：**GEMV R2 已完成并正式验证，真正的多 token GEMM 尚未开始。** R1 修复了 CUDA
 BF16 路径忽略 `scale` 的接口语义，并用奇数 M 覆盖向量化尾部；R2 为偶数 M 增加
 BF16x2/FP32x2 成对读取、双 accumulator、直接 CUB reduction，并通过 128/256/512
 threads 实测选择 256。当前 decode 和
@@ -20,7 +20,7 @@ x[M] * W[K, M]^T -> y[K]
 
 ## 1. 面试讲解主线
 
-当前可以先这样描述问题和优化方向；最终数字会在各轮实验完成后更新：
+当前 R2 可以这样完整描述：
 
 > 我先把框架中的 MatmulLayer 按实际 workload 拆成 decode GEMV 和后续 prefill
 > GEMM。优化前 BF16 GEMV 每个输出行启动一个 128-thread block，每个线程以标量方式
@@ -28,9 +28,12 @@ x[M] * W[K, M]^T -> y[K]
 > 投影的 DRAM throughput 达 90.18%–93.95%，SM throughput 只有 20.72%–31.54%，
 > long-scoreboard 占 70.97%–88.15%，说明主要受权重流量和访存等待限制；但 32 输出
 > 的 gate 投影只有 32 blocks、0.05 waves/SM，是 launch/并行度受限。于是我不会用同一
-> 个 kernel 策略解释所有形状：中大型 GEMV 优先尝试 BF16x2/FP32x2 向量读取、双累加器
-> 提升 memory-level parallelism，并比较 128/256 threads；小输出投影单独评估融合或
-> 多行映射；LM head 则作为超大 K 的独立带宽案例。真正多 token prefill 完成后，再以
+> 个 kernel 策略解释所有形状。我为偶数 M 实现 BF16x2/FP32x2 成对读取、双累加器和
+> 直接 CUB reduction，并实测 128/256/512 threads，最终选择 256；奇数 M 保留 scalar
+> fallback。global-load 指令减半、37 registers 且没有 spill。三次正式 NCU 的中位
+> duration 相对基线在 gate、GDN out、MLP down 上分别下降 16.9%、10.6%、5.7%，真实
+> 4B 的逐层误差和 10 个 token 均通过。LM head 的 Event/NCU 波动跨过基线，所以只记录
+> 为未证实的微小收益，并留作独立 specialization。真正多 token prefill 完成后，再以
 > cuBLASLt 作为可靠基准并评估 Tensor Core tiled GEMM。
 
 ## 2. 优化对象与 4B 代表形状
@@ -175,7 +178,8 @@ acc1 += x1 * w1
 
 1. operator CPU/CUDA 对照，包括 scale、奇数 M 和 4B 大尺寸；
 2. 完整 GTest、CTest；对可能改变模型数值次序的版本补真实 4B trace；
-3. 六个 4B GEMV shape 的 cold-cache CUDA Event，至少三组，报告 median/p95；
+3. 全部 13 个已注册 4B GEMV shape 的 cold-cache CUDA Event，至少三组，报告
+   median/p95；
 4. gate、中型投影、MLP down、LM head 的重复 NCU，报告 duration、DRAM、SM、stall、
    instructions、registers 和 local spill；
 5. 至少主要中大型 shape 不退化，若采用 shape dispatch，要明确适用区间和 fallback；
@@ -187,7 +191,7 @@ acc1 += x1 * w1
 |---|---|---|---|---|---|---|
 | R0 | `304eea3` | 128-thread 标量 BF16 GEMV | 4B 大投影通过 | 见基线文档 | 见第 4 节 | 优化前基线 |
 | R1 | `cf66f5e` | scale + 奇数 M 护栏/修复 | focused/完整测试通过 | 不适用 | 不适用 | 已完成 |
-| R2 | 本轮提交 | BF16x2、双 accumulator、直接 CUB reduction | 3/3 focused | 全 shape 已测 | 4 类 shape 已测 | 接受 256 threads |
+| R2 | `00b03df` | BF16x2、双 accumulator、直接 CUB reduction | 56/56 + 真实 4B | 全 shape 三组 | 4 类 shape 三组 | 接受 256 threads |
 | R3 | R2 已完成 block 搜索 | 128/256/512 threads 对照 | 同 R2 | 256 通用最优 | 256 已测 | 接受 256 threads |
 | R4 | 待实验 | 小 K specialization 或 gate 融合 | 待测 | 待测 | 待测 | 待定 |
 | R5 | prefill 后 | 真正的多 token GEMM | 待测 | 待测 | 待测 | 尚未开始 |
@@ -270,5 +274,75 @@ GDN out 从 2,426,880 增到 2,836,480，LM head 从 179,783,680 增到 271,165,
 └── 4b-stage2-gemv-r2-bf16x2-512/cuda-events
 ```
 
-R2 提交后还需重建 benchmark 并采三次正式 NCU，使报告的 Git commit 与源码一致；正式
-哈希和重复结果将在下一次文档提交补齐。
+### 7.3 R2 提交后的正式复测
+
+正式报告在 commit `00b03df` 提交并重新 configure/build 后采集，JSON 中的完整 commit
+为 `00b03df74d136767b74839a275598207acde3d9e`。CUDA Event 进行了三组全 shape
+复测，每组 cold cache、5 warmup、30 samples：
+
+| Shape | R0 median | R2 三组 median | 稳定结论 |
+|---|---:|---:|---|
+| gate `32×2560` | 6.144 us | 5.120 / 5.120 / 5.120 us | 下降 16.7% |
+| full K/V `1024×2560` | 21.504 us | 20.480 / 20.480 / 20.480 us | 下降 4.8% |
+| GDN out `2560×4096` | 67.584 us | 66.560 / 66.560 / 66.560 us | 下降 1.5% |
+| GDN QKV `8192×2560` | 129.024 us | 128.000 / 127.072 / 128.000 us | 下降约 0.8%–1.5% |
+| MLP up `9216×2560` | 143.376 us | 142.336 / 143.360 / 142.400 us | 下降约 0%–0.7% |
+| MLP down `2560×9216` | 148.480 us | 143.360 / 143.360 / 143.360 us | 下降 3.4% |
+| LM head `248320×2560` | 3595.264 us | 3614.720 / 3750.912 / 3642.368 us | 跨时段未证实收益 |
+
+LM head 的三组短 Event median 没有复现探索阶段的 3570.688 us，并且整套测试中可见
+周期性 WSL 调度离散值。为区分 kernel 选择和跨时段波动，又做了紧邻的 200-sample A/B：
+改良 scalar/128 fallback 为 3593.728 us，vector/256 为 3573.760 us，vector 快 0.56%。
+因此保留 vector/256，但只把 LM head 结论写为“收益微小且尚不稳健”；下一轮 LM-head
+specialization 必须改善绝对 weight bandwidth，不能依赖 0.5% 级噪声。
+
+三组正式 NCU 的 duration 如下。括号中是三组的中位数，相对 R0 只用该中位数计算：
+
+| Shape | R0 | R2 三次 NCU duration | 中位数变化 |
+|---|---:|---:|---:|
+| gate | 3.776 us | 3.136 / 3.136 / 3.072 us（3.136） | −16.9% |
+| GDN out | 59.680 us | 53.376 / 56.352 / 46.208 us（53.376） | −10.6% |
+| MLP down | 140.896 us | 134.816 / 125.184 / 132.800 us（132.800） | −5.7% |
+| LM head | 4009.280 us | 3984.224 / 3517.760 / 4437.888 us（3984.224） | −0.6%，波动跨过 R0 |
+
+gate、GDN out、MLP down 三次都快于 R0，支持接受 R2；LM head 的范围跨过 R0，不能
+用中位数包装成确定收益。硬件层面的稳定事实仍是 global-load 指令减半、37 registers、
+0 local load/store；性能波动主要来自 NCU/WSL 下的频率和调度，而不是 spill。
+
+真实 Qwen3.5-4B BF16 checkpoint 也完成了 CUDA 逐层 trace。相对优化前保存的 Kuiper
+CPU reference，decoder 最大相对误差为 `2.14677e-05`，final norm 为 `2.88499e-06`，
+logits 为 `2.60097e-06`；10 个 greedy token 完全一致。相对 R2 前 CUDA trace，decoder
+最大相对误差为 `1.38607e-06`，logits 为 `4.15089e-07`，token 同样完全一致。这说明
+双 accumulator 改变 reduction 次序后只有预期的 FP32 舍入差异，没有改变模型行为。
+
+正式产物目录：
+
+```text
+/home/tuesday/workspace/icd/profiles/KuiperLLama/qwen35/4b-stage2-gemv-after-00b03df/
+├── cuda-events-run1/
+├── cuda-events-run2/
+├── cuda-events-run3/
+├── ncu-run1/
+├── ncu-run2/
+├── ncu-run3/
+└── model-validation/cuda/
+```
+
+正式 NCU report SHA-256：
+
+| Run | gate | GDN out | MLP down | LM head |
+|---|---|---|---|---|
+| 1 | `863c604f4d6a988ca20c24ffe940e998ef0c62064d99a142d1af6cc6401e4b0f` | `f4dfb2c5de218529b742199944774d7c601bbf48cdad272668419af23691d343` | `90ee1fdb83407eba5789293a06e953adc4022efdb3b7d0ebebedb9fa9e91b08f` | `f6e6f84d88377f8b0bf661e333d6d1513d1dba85ee0e5a1fce0b8464419060ed` |
+| 2 | `0ccfe5d459b88577d6c42ccea2f117d82451c7db07f9f4aa37429ed6dfb28641` | `3dfdd6d36803b98838de2a8fb24232caa33ec1b9c62c681c707be1558d1fa88c` | `211f7d6d43ed692eb845b77e60a829b2389f779b966c2f7c705c89e4546bf938` | `174ea19a8b6fedbe9fb1b5137681ceb51cf0fa71a70cce9f44169ab8cbd00266` |
+| 3 | `ed2faa2c998d19275f6cedd7e6abd8b77ef950f3e99b989bacb47784b714eb87` | `e80a64d5dbadce9a03b41a718b499258bb24a40343246b21203eecb2a9b882ab` | `485c97c2a1871bb5a51a7346d27d2e9c1029c5f0a64fe829af9d91567ad49245` | `0d58f845e63aa2e55fe437624826ca5bcf0437977aed4cdc397ae1da9371a5c6` |
+
+## 8. 下一步
+
+R2 已经拿到“指令级向量化 + block 并行度”的第一轮收益，但大投影仍然是 weight
+bandwidth-bound。下一轮优先级为：
+
+1. 单独处理 K=32 的成对 A/B gate projection，判断 fusion 能否继续减少 launch；
+2. 对 LM head 研究真正减少或更高效组织权重流量的 specialization，并保留完整 logits
+   API 的正确性；
+3. 不在 N=1 GEMV 上强行使用 Tensor Core；先实现并行 prefill 接口，再开始多 token
+   GEMM、cuBLASLt baseline 和自研 tiled kernel 对照。

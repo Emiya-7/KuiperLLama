@@ -22,6 +22,9 @@ GEMV/MatMul 做优化前后对照。9B 独立 `lm_head`、INT8 暂停，长 prom
 BF16 线性层已进入优化阶段；decode GEMV 与后续并行 prefill GEMM 的边界、基线指标和
 分轮计划见
 [`benchmarks/qwen35/BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md`](benchmarks/qwen35/BF16_GEMV_GEMM_OPTIMIZATION_PROCESS.md)。
+第一轮 BF16x2/256-thread GEMV 已完成：global-load 指令减半，正式 NCU 中 gate、GDN
+out、MLP down 的中位 duration 分别改善 16.9%、10.6%、5.7%；LM head 波动跨过基线，
+只记录为尚未证实的微小收益。真实 4B trace 的 10 个 token 保持完全一致。
 
 ---
 
